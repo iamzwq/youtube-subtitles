@@ -76,10 +76,18 @@ DEFAULT_CONFIG = {
 
 SENTENCE_END_PUNCT = {'.', '!', '?', '。', '！', '？', '…'}
 
+# 可朗读字符：字母、数字、中日韩文字
+SPEAKABLE_CHAR_RE = re.compile(r'[a-zA-Z0-9\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff66-\uff9f]')
+
+
+def has_speakable_text(text: str) -> bool:
+    """判断文本是否含有可朗读的内容（纯标点/空白/符号的文本无法合成语音）"""
+    return bool(SPEAKABLE_CHAR_RE.search(text or ""))
+
 TRANSLATE_BATCH_SIZE = 40   # 每批发送给 LLM 翻译的句子数（防止长视频超出 max_tokens 被截断）
 MAX_RETRIES = 3             # 网络 API 最大重试次数
 TTS_CONCURRENCY = 5         # edge-tts 并发上限（过高会被限流/封禁）
-TTS_MAX_TEMPO = 2.0         # 配音加速上限（倍速）
+TTS_MAX_TEMPO = 3.0         # 配音加速上限（倍速）
 SAMPLE_RATE = 48000         # 拼接音轨的采样率
 
 
@@ -192,14 +200,64 @@ def get_video_metadata(url: str) -> Dict:
     return json.loads(first_line)
 
 
-def detect_default_language(metadata: Dict) -> str:
-    """检测视频默认语言"""
-    lang = metadata.get("language")
-    if lang and lang not in ("none", "und", ""):
-        print(f"[语言检测] 视频元数据标记的语言: {lang}")
-        return lang
+def _resolve_available_track(lang: Optional[str], available: set, subtitles_info: Dict = None) -> Optional[str]:
+    """把语言代码匹配到实际存在的字幕轨道。
 
+    匹配顺序：精确匹配 > xx-orig > 去掉区域后缀的基础语言 > 基础语言的 xx-orig。
+    如果多个候选都存在，优先选择有 json3 格式的轨道（避免下载到纯 vtt 无法解析词级时间戳）。
+    """
+    if not lang or lang in ("none", "und", ""):
+        return None
+    candidates = [
+        lang,
+        f"{lang}-orig",
+        lang.split("-")[0],
+        f"{lang.split('-')[0]}-orig",
+    ]
+    # 去重，保留顺序
+    seen = set()
+    unique = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c); unique.append(c)
+
+    def has_json3(track: str) -> bool:
+        """检查该轨道是否支持 json3 格式"""
+        if not subtitles_info:
+            return True  # 无格式信息时假设可用
+        track_info = subtitles_info.get(track, {})
+        if isinstance(track_info, list):
+            formats = track_info
+        elif isinstance(track_info, dict):
+            formats = track_info.get("formats", track_info.get("ext", []))
+        else:
+            formats = []
+        return any("json3" in str(f) for f in formats)
+
+    # 优先选有 json3 的候选
+    for cand in unique:
+        if cand in available and has_json3(cand):
+            return cand
+    # 没有任何 json3 候选时，退而求其次选第一个存在的
+    for cand in unique:
+        if cand in available:
+            return cand
+    return None
+
+
+def detect_default_language(metadata: Dict) -> str:
+    """检测视频默认语言（必须与实际可用的字幕轨道对齐）"""
     auto_caps = metadata.get("automatic_captions", {})
+    manual_subs = metadata.get("subtitles", {})
+    available = set(auto_caps) | set(manual_subs)
+
+    # 先尝试元数据标记的语言，但必须校验该语言的字幕轨道真实存在
+    # 只看自动字幕格式（下载优先用 --write-auto-subs）
+    resolved = _resolve_available_track(metadata.get("language"), available, auto_caps)
+    if resolved:
+        print(f"[语言检测] 视频元数据标记的语言: {metadata['language']} -> 字幕轨道: {resolved}")
+        return resolved
+
     if auto_caps:
         # 优先选择带 -orig 后缀的原始 ASR 轨道，避免误选到翻译语言
         orig_keys = [k for k in auto_caps if k.endswith("-orig")]
@@ -303,7 +361,7 @@ def parse_json3(json3_path: Path) -> List[Dict]:
 
     words = []
     events = data.get("events", [])
-    last_word_event = None  # 记录产生最后一个词的 event，用于计算末词结束时间
+    last_word_event = None  # 记录最后一个真实词所在的 event
 
     for event in events:
         base_time = event.get("tStartMs", 0)
@@ -314,7 +372,12 @@ def parse_json3(json3_path: Path) -> List[Dict]:
         appended = False
         for seg in segs:
             text = seg.get("utf8", "")
+            # JSON3 用独立的换行 seg 分隔字幕行：保留空格，但不让它参与词语计时。
             if not text:
+                continue
+            if not text.strip():
+                if words and not words[-1]["text"].endswith((" ", "\n")):
+                    words[-1]["text"] += " "
                 continue
             offset = seg.get("tOffsetMs", 0)
             words.append({
@@ -328,7 +391,7 @@ def parse_json3(json3_path: Path) -> List[Dict]:
             last_word_event = event
 
     for i in range(len(words) - 1):
-        # 保证 end_ms 不早于 start_ms，避免出现负时长
+        # 使用下一个真实词的开始时间，避免把换行 event 的时间算成词尾。
         words[i]["end_ms"] = max(words[i + 1]["start_ms"], words[i]["start_ms"])
 
     if words and last_word_event is not None:
@@ -352,26 +415,34 @@ def split_into_sentences(words: List[Dict]) -> List[Dict]:
 
         stripped = text.rstrip()
         if stripped and stripped[-1] in SENTENCE_END_PUNCT:
+            sentence_text = "".join(w["text"] for w in current_words).strip()
+            # 纯标点/无实际内容的片段（如独立的 "..."）不成句，直接丢弃
+            if has_speakable_text(sentence_text):
+                sentences.append({
+                    "text": sentence_text,
+                    "words": current_words,
+                    "start_ms": current_words[0]["start_ms"],
+                    "end_ms": current_words[-1]["end_ms"],
+                    "start_idx": start_idx,
+                    "end_idx": i,
+                })
+                start_idx = i + 1
+            else:
+                # 被丢弃的片段不重置 start_idx，时间轴归入下一句
+                pass
+            current_words = []
+
+    if current_words:
+        sentence_text = "".join(w["text"] for w in current_words).strip()
+        if has_speakable_text(sentence_text):
             sentences.append({
-                "text": "".join(w["text"] for w in current_words).strip(),
+                "text": sentence_text,
                 "words": current_words,
                 "start_ms": current_words[0]["start_ms"],
                 "end_ms": current_words[-1]["end_ms"],
                 "start_idx": start_idx,
-                "end_idx": i,
+                "end_idx": len(words) - 1,
             })
-            current_words = []
-            start_idx = i + 1
-
-    if current_words:
-        sentences.append({
-            "text": "".join(w["text"] for w in current_words).strip(),
-            "words": current_words,
-            "start_ms": current_words[0]["start_ms"],
-            "end_ms": current_words[-1]["end_ms"],
-            "start_idx": start_idx,
-            "end_idx": len(words) - 1,
-        })
 
     print(f"[分句] 共 {len(sentences)} 句")
     return sentences
@@ -560,8 +631,9 @@ class LLMClient:
 # ==================== 字幕后处理 ====================
 
 def split_long_sentence(text: str, start_ms: int, end_ms: int, max_chars: int) -> List[Dict]:
-    """按逗号/顿号拆分长句"""
-    delimiters = ['，', '、', '；', ',', ';']
+    """仅根据标点符号拆分长句；无标点时不硬切"""
+    # 包含逗号类和句末类标点
+    delimiters = ['，', '、', '；', ',', ';', '。', '！', '？', '…']
 
     # 第一遍：按标点切成子句
     clauses = []
@@ -573,20 +645,16 @@ def split_long_sentence(text: str, start_ms: int, end_ms: int, max_chars: int) -
     if last_end < len(text):
         clauses.append(text[last_end:])
 
-    # 第二遍：把子句打包到不超过 max_chars 的片段；单个子句本身超长则按字符硬切
+    # 第二遍：把子句打包到不超过 max_chars 的片段。
+    # 注意：单个子句本身超长且内部没有标点时，不做硬切（保持整句完整）
     parts = []
     buffer = ""
     for clause in clauses:
-        if len(clause) > max_chars:
-            if buffer:
-                parts.append(buffer)
-                buffer = ""
-            for j in range(0, len(clause), max_chars):
-                parts.append(clause[j:j+max_chars])
-        elif len(buffer) + len(clause) <= max_chars:
+        if len(buffer) + len(clause) <= max_chars:
             buffer += clause
         else:
-            parts.append(buffer)
+            if buffer:
+                parts.append(buffer)
             buffer = clause
     if buffer:
         parts.append(buffer)
@@ -594,21 +662,19 @@ def split_long_sentence(text: str, start_ms: int, end_ms: int, max_chars: int) -
     if len(parts) <= 1:
         return [{"text": text, "start_ms": start_ms, "end_ms": end_ms}]
 
-    total_chars = len(text)
+    # 按中文 TTS 估算时长（约130ms/字）比例分配时间，保证每段配音都能在时间槽内自然播放
+    est_durations = [len(p) * 130 for p in parts]
+    total_est = sum(est_durations)
+    available = max(end_ms - start_ms, 0)
     results = []
     current_ms = start_ms
 
-    # 时间下限不能超过总时长均摊值，否则会产生零/负时长字幕
-    available = max(end_ms - start_ms, 0)
-    min_gap = min(800, max(available // len(parts), 1))
-
-    for i, part in enumerate(parts):
+    for i, (part, est_dur) in enumerate(zip(parts, est_durations)):
         if i == len(parts) - 1:
             part_end = end_ms
         else:
-            ratio = len(part) / total_chars
-            part_end = int(start_ms + available * ratio)
-            part_end = max(part_end, current_ms + min_gap)
+            part_end = current_ms + int(available * est_dur / total_est)
+            part_end = max(part_end, current_ms + 200)  # 保底200ms，避免零时长
 
         results.append({"text": part.strip(), "start_ms": current_ms, "end_ms": part_end})
         current_ms = part_end
@@ -643,6 +709,10 @@ def postprocess_subtitles(sentences: List[Dict], translations: List[str],
 
     for sent, trans in zip(sentences, translations):
         duration = sent["end_ms"] - sent["start_ms"]
+
+        # 跳过纯标点/无实际内容的译文（否则 TTS 会报 NoAudioReceived）
+        if not has_speakable_text(trans):
+            continue
 
         if len(trans) > max_chars or duration > max_duration:
             parts = split_long_sentence(trans, sent["start_ms"], sent["end_ms"], max_chars)
@@ -741,6 +811,9 @@ class TTSClient:
                             pitch=self.pitch,
                         )
                         await communicate.save(str(output_path))
+                        # 校验确实生成了音频内容（空文件说明服务端未返回音频）
+                        if not output_path.exists() or output_path.stat().st_size == 0:
+                            raise RuntimeError("服务端未返回音频数据")
                         # 若配音超过时间槽，加速以避免压到下一句
                         fit_tts_duration(output_path, slots[idx])
                         return output_path
@@ -813,8 +886,29 @@ def mix_tts_audio(subs: List[Dict], tts_files: List[Path], output_audio: Path):
     for sub, f in zip(subs, tts_files):
         pcm = _decode_to_pcm16(f)
         offset = int(sub.get("start_ms", 0)) * SAMPLE_RATE // 1000
-        clips.append((offset, pcm))
+        clips.append([offset, pcm])
         total_samples = max(total_samples, offset + len(pcm) + SAMPLE_RATE)
+
+    # 防止语音重叠：每条配音最长只能延续到下一句开始的位置。
+    # 加速（atempo）有上限仍可能放不下，超出部分直接截断并淡出。
+    FADE_SAMPLES = 480  # 10ms @ 48kHz
+    truncated = 0
+    for i in range(len(clips)):
+        offset, pcm = clips[i]
+        if i + 1 < len(clips):
+            max_len = clips[i + 1][0] - offset
+        else:
+            max_len = len(pcm)
+        if len(pcm) > max_len:
+            pcm = pcm[:max(max_len, 1)].copy()
+            fade = min(len(pcm), FADE_SAMPLES)
+            if fade > 0:
+                ramp = np.linspace(1.0, 0.0, fade)
+                pcm[len(pcm)-fade:] = (pcm[len(pcm)-fade:] * ramp).astype(np.int16)
+            clips[i][1] = pcm
+            truncated += 1
+    if truncated:
+        print(f"[音频] 有 {truncated} 条配音超出时间槽，已截断以避免语音重叠")
 
     master = np.zeros(total_samples, dtype=np.int16)
     for offset, pcm in clips:
@@ -908,7 +1002,7 @@ def compose_final_video(video_path: Path, srt_path: Optional[Path],
         print("[警告] 未找到 ffmpeg，跳过最终合成")
         return False
 
-    sub_style = "FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=0,MarginV=50"
+    sub_style = "FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=0,MarginV=15"
     cmd = ["ffmpeg", "-y", "-i", str(video_path)]
 
     if srt_path and audio_path:
@@ -965,6 +1059,7 @@ def main():
     parser.add_argument("--no-burn", action="store_true", help="跳过烧录字幕到视频")
     parser.add_argument("--no-tts", action="store_true", help="跳过中文配音")
     parser.add_argument("--lang", default=None, help="强制指定语言代码（如 en, ja, zh-CN）")
+    parser.add_argument("--retranslate", action="store_true", help="忽略翻译缓存，重新断句、翻译并生成字幕")
 
     args = parser.parse_args()
 
@@ -1055,6 +1150,10 @@ def main():
         source_sha = hashlib.sha1(
             "\n".join(s["text"] for s in sentences).encode("utf-8")
         ).hexdigest()
+
+        if args.retranslate and cache_path.exists():
+            cache_path.unlink()
+            print(f"[翻译] --retranslate: 已删除旧缓存 {cache_path}")
 
         def save_cache(res: Dict[int, str]):
             """把当前进度写入缓存（未完成的句子存为 null，便于断点续传）"""
