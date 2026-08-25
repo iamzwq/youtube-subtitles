@@ -1,0 +1,1202 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+YouTube 视频自动下载 + 词级字幕翻译 + 纯中文 SRT 字幕生成 + 中文配音
+
+功能：
+1. 自动检测视频默认语言
+2. 下载视频 + JSON3 词级字幕（输出目录为视频ID）
+3. 解析字幕 → 按标点分句 → 记录每句首尾词时间
+4. 调用 LLM 整篇翻译（带标题/简介上下文）
+5. 时间对齐 → 生成纯中文 SRT 字幕
+6. 中文配音：支持 edge-tts（免费）或 MiMo TTS（高质量），自动按时间槽调速
+7. 字幕烧录 + 配音一步合成最终视频（--no-burn / --no-tts 可分别跳过）
+8. 翻译结果本地缓存（逐批保存），中断后重跑自动断点续传
+
+用法：
+    python youtube_subtitle_translator.py "https://www.youtube.com/watch?v=xxxxx"
+
+    # 指定配置文件
+    python youtube_subtitle_translator.py "URL" --config ./my_config.json
+
+    # 跳过烧录字幕
+    python youtube_subtitle_translator.py "URL" --no-burn
+
+    # 跳过配音
+    python youtube_subtitle_translator.py "URL" --no-tts
+
+依赖：
+    pip install yt-dlp openai edge-tts numpy
+    # 以及系统安装 ffmpeg / ffprobe
+"""
+
+import argparse
+import asyncio
+import base64
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+import sys
+import time
+import wave
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+
+from openai import OpenAI
+
+
+# ==================== 配置加载 ====================
+
+DEFAULT_CONFIG = {
+    "llm": {
+        "provider": "mimo",
+        "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+        "api_key": "",
+        "model": "mimo-v2.5-pro",
+        "supports_system_role": False
+    },
+    "tts": {
+        "enabled": True,
+        "engine": "edge-tts",
+        "voice": "zh-CN-XiaoxiaoNeural",
+        "rate": "+0%",
+        "volume": "+0%",
+        "pitch": "+0Hz",
+        "mix_with_original": False
+    },
+    "subtitle": {
+        "max_chars_per_line": 35,
+        "min_duration_ms": 800,
+        "max_duration_ms": 6000
+    }
+}
+
+SENTENCE_END_PUNCT = {'.', '!', '?', '。', '！', '？', '…'}
+
+TRANSLATE_BATCH_SIZE = 40   # 每批发送给 LLM 翻译的句子数（防止长视频超出 max_tokens 被截断）
+MAX_RETRIES = 3             # 网络 API 最大重试次数
+TTS_CONCURRENCY = 5         # edge-tts 并发上限（过高会被限流/封禁）
+TTS_MAX_TEMPO = 2.0         # 配音加速上限（倍速）
+SAMPLE_RATE = 48000         # 拼接音轨的采样率
+
+
+def load_config(config_path: Optional[Path] = None) -> Dict:
+    """加载配置文件，支持 JSON 格式"""
+    if config_path is None:
+        config_path = Path(__file__).parent / "config.json"
+
+    config = json.loads(json.dumps(DEFAULT_CONFIG))  # 深拷贝
+
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            user_config = json.load(f)
+        _deep_update(config, user_config)
+        print(f"[配置] 已加载: {config_path}")
+    else:
+        generate_default_config(config_path)
+        print(f"[配置] 未找到配置文件，已生成模板: {config_path}")
+        print("[配置] 请编辑该文件填入你的 API Key 后再运行")
+        sys.exit(1)
+
+    # 验证 LLM 配置
+    llm = config.get("llm", {})
+    if not llm.get("api_key"):
+        print("[错误] 配置文件中缺少 llm.api_key", file=sys.stderr)
+        sys.exit(1)
+    if not llm.get("base_url"):
+        print("[错误] 配置文件中缺少 llm.base_url", file=sys.stderr)
+        sys.exit(1)
+    if not llm.get("model"):
+        print("[错误] 配置文件中缺少 llm.model", file=sys.stderr)
+        sys.exit(1)
+
+    # 验证 TTS 配置（如果启用）
+    tts = config.get("tts", {})
+    if tts.get("enabled", True) and tts.get("engine") == "mimo":
+        if not tts.get("api_key") and not llm.get("api_key"):
+            print("[错误] TTS 使用 mimo 引擎时需要 api_key", file=sys.stderr)
+            sys.exit(1)
+
+    return config
+
+
+def _deep_update(base: Dict, update: Dict):
+    """深度合并字典"""
+    for key, value in update.items():
+        if isinstance(value, dict) and key in base and isinstance(base[key], dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+
+
+def generate_default_config(path: Path):
+    """生成默认配置文件模板"""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
+
+
+# ==================== 工具函数 ====================
+
+def ms_to_srt_time(ms: int) -> str:
+    """毫秒转 SRT 时间格式 HH:MM:SS,mmm"""
+    hours = ms // 3600000
+    ms %= 3600000
+    minutes = ms // 60000
+    ms %= 60000
+    seconds = ms // 1000
+    milliseconds = ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+
+def extract_video_id(url: str) -> str:
+    """从 YouTube URL 提取视频 ID"""
+    patterns = [
+        r'(?:v=|/v/|/embed/|/shorts/|youtu\.be/)([a-zA-Z0-9_-]{11})',
+        r'^([a-zA-Z0-9_-]{11})$',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    raise ValueError(f"无法从 URL 提取视频 ID: {url}")
+
+
+# ==================== yt-dlp 相关 ====================
+
+def sanitize_filename(name: str, max_len: int = 60) -> str:
+    """清理字符串使其可安全用作文件名（去除 Windows 非法字符并限制长度）"""
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]', " ", name)
+    cleaned = cleaned.strip().rstrip(". ")
+    return cleaned[:max_len].strip()
+
+
+def run_yt_dlp(args: List[str]) -> subprocess.CompletedProcess:
+    """运行 yt-dlp 命令"""
+    cmd = ["yt-dlp"] + args
+    print(f"[yt-dlp] {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode != 0:
+        print(f"[yt-dlp stderr] {result.stderr}", file=sys.stderr)
+    return result
+
+
+def get_video_metadata(url: str) -> Dict:
+    """获取视频元数据"""
+    result = run_yt_dlp(["--dump-json", "--skip-download", url])
+    if result.returncode != 0:
+        raise RuntimeError(f"无法获取视频元数据: {result.stderr}")
+    first_line = result.stdout.strip().splitlines()[0]
+    return json.loads(first_line)
+
+
+def detect_default_language(metadata: Dict) -> str:
+    """检测视频默认语言"""
+    lang = metadata.get("language")
+    if lang and lang not in ("none", "und", ""):
+        print(f"[语言检测] 视频元数据标记的语言: {lang}")
+        return lang
+
+    auto_caps = metadata.get("automatic_captions", {})
+    if auto_caps:
+        # 优先选择带 -orig 后缀的原始 ASR 轨道，避免误选到翻译语言
+        orig_keys = [k for k in auto_caps if k.endswith("-orig")]
+        first_lang = orig_keys[0] if orig_keys else list(auto_caps.keys())[0]
+        print(f"[语言检测] 从自动字幕列表推断: {first_lang}")
+        return first_lang
+
+    manual_subs = metadata.get("subtitles", {})
+    if manual_subs:
+        first_lang = list(manual_subs.keys())[0]
+        print(f"[语言检测] 从手动字幕列表推断: {first_lang}")
+        return first_lang
+
+    print("[语言检测] 无法检测语言，fallback 到 en")
+    return "en"
+
+
+def download_video_and_subs(url: str, output_dir: Path, lang: str) -> Tuple[Path, Path, Optional[Path], Dict]:
+    """下载视频和 JSON3 字幕"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata = get_video_metadata(url)
+    video_id = metadata["id"]
+    title = metadata.get("title", "unknown")
+
+    print(f"[下载] 视频标题: {title}")
+    print(f"[下载] 视频ID: {video_id}")
+    print(f"[下载] 目标语言: {lang}")
+
+    template = str(output_dir / "%(id)s")
+
+    result = run_yt_dlp([
+        "-f", "bestvideo*+bestaudio/best",
+        "--write-auto-subs",
+        "--sub-langs", lang,
+        "--sub-format", "json3",
+        "--write-thumbnail",
+        "--convert-thumbnails", "jpg",
+        "-o", template,
+        url,
+    ])
+
+    if result.returncode != 0:
+        print(f"[下载] 自动字幕下载失败，尝试手动字幕...")
+        result = run_yt_dlp([
+            "-f", "bestvideo*+bestaudio/best",
+            "--write-subs",
+            "--sub-langs", lang,
+            "--sub-format", "json3",
+            "--write-thumbnail",
+            "--convert-thumbnails", "jpg",
+            "-o", template,
+            url,
+        ])
+        if result.returncode != 0:
+            raise RuntimeError(f"字幕下载失败: {result.stderr}")
+
+    video_path = None
+    sub_path = None
+    thumbnail_path = None
+
+    for f in output_dir.iterdir():
+        if not f.stem.startswith(video_id):
+            continue
+        # 排除本脚本生成的衍生文件（如 xxx_zh_final.mp4），
+        # 避免重跑时把上次的成品当成原视频，导致字幕/配音叠加
+        if f.stem[len(video_id):].startswith("_zh"):
+            continue
+        suffix = f.suffix.lower()
+        if suffix in (".mp4", ".webm", ".mkv", ".mov"):
+            if video_path is None or len(f.stem) < len(video_path.stem):
+                # 优先选择文件名恰好等于视频 ID 的原始下载文件
+                video_path = f
+        elif suffix == ".json3":
+            if lang in f.name or sub_path is None:
+                if sub_path is None or (lang in f.name and lang not in sub_path.name):
+                    sub_path = f
+        elif suffix in (".jpg", ".jpeg", ".png", ".webp"):
+            if thumbnail_path is None or suffix == ".jpg":
+                thumbnail_path = f
+
+    if video_path is None:
+        raise FileNotFoundError(f"未找到下载的视频文件 (ID: {video_id})")
+    if sub_path is None:
+        raise FileNotFoundError(f"未找到下载的字幕文件 (语言: {lang})")
+
+    print(f"[下载完成] 视频: {video_path}")
+    print(f"[下载完成] 字幕: {sub_path}")
+    if thumbnail_path:
+        print(f"[下载完成] 封面: {thumbnail_path}")
+
+    return video_path, sub_path, thumbnail_path, metadata
+
+
+# ==================== JSON3 解析 ====================
+
+def parse_json3(json3_path: Path) -> List[Dict]:
+    """解析 YouTube JSON3 字幕文件"""
+    with open(json3_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    words = []
+    events = data.get("events", [])
+    last_word_event = None  # 记录产生最后一个词的 event，用于计算末词结束时间
+
+    for event in events:
+        base_time = event.get("tStartMs", 0)
+        segs = event.get("segs", [])
+        if not segs:
+            continue
+
+        appended = False
+        for seg in segs:
+            text = seg.get("utf8", "")
+            if not text:
+                continue
+            offset = seg.get("tOffsetMs", 0)
+            words.append({
+                "text": text,
+                "start_ms": base_time + offset,
+                "end_ms": None,
+            })
+            appended = True
+
+        if appended:
+            last_word_event = event
+
+    for i in range(len(words) - 1):
+        # 保证 end_ms 不早于 start_ms，避免出现负时长
+        words[i]["end_ms"] = max(words[i + 1]["start_ms"], words[i]["start_ms"])
+
+    if words and last_word_event is not None:
+        last_end = (last_word_event.get("tStartMs", 0)
+                    + last_word_event.get("dDurationMs", 0))
+        words[-1]["end_ms"] = max(last_end, words[-1]["start_ms"])
+
+    print(f"[解析] 共提取 {len(words)} 个词")
+    return words
+
+
+def split_into_sentences(words: List[Dict]) -> List[Dict]:
+    """按标点分句"""
+    sentences = []
+    current_words = []
+    start_idx = 0
+
+    for i, word in enumerate(words):
+        text = word["text"]
+        current_words.append(word)
+
+        stripped = text.rstrip()
+        if stripped and stripped[-1] in SENTENCE_END_PUNCT:
+            sentences.append({
+                "text": "".join(w["text"] for w in current_words).strip(),
+                "words": current_words,
+                "start_ms": current_words[0]["start_ms"],
+                "end_ms": current_words[-1]["end_ms"],
+                "start_idx": start_idx,
+                "end_idx": i,
+            })
+            current_words = []
+            start_idx = i + 1
+
+    if current_words:
+        sentences.append({
+            "text": "".join(w["text"] for w in current_words).strip(),
+            "words": current_words,
+            "start_ms": current_words[0]["start_ms"],
+            "end_ms": current_words[-1]["end_ms"],
+            "start_idx": start_idx,
+            "end_idx": len(words) - 1,
+        })
+
+    print(f"[分句] 共 {len(sentences)} 句")
+    return sentences
+
+
+# ==================== LLM 翻译 ====================
+
+class LLMClient:
+    """统一 LLM 客户端"""
+
+    def __init__(self, config: Dict):
+        self.provider = config.get("provider", "openai")
+        self.model = config["model"]
+        self.supports_system_role = config.get("supports_system_role", True)
+
+        base_url = config["base_url"].rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url += "/v1"
+
+        self.client = OpenAI(
+            api_key=config["api_key"],
+            base_url=base_url,
+            timeout=120,
+        )
+
+        print(f"[LLM] 初始化: {self.provider} @ {base_url}")
+        print(f"[LLM] 模型: {self.model}")
+
+    def _chat(self, messages: List[Dict], temperature: float = 0.3) -> str:
+        """调用聊天接口（带重试机制）"""
+        last_err = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=8192,
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                last_err = e
+                wait = 2 ** attempt
+                print(f"[翻译] 调用失败 (第 {attempt}/{MAX_RETRIES} 次): {e}，{wait}s 后重试...")
+                time.sleep(wait)
+        raise RuntimeError(f"LLM 调用失败（已重试 {MAX_RETRIES} 次）: {last_err}")
+
+    def translate(self, sentences: List[Dict], title: str, description: str,
+                  done: Optional[Dict[int, str]] = None,
+                  on_progress=None) -> List[str]:
+        """分批翻译所有句子（结构化 JSON 输出，按 id 对齐，避免错位）。
+
+        done: 已有缓存译文的 {id: 译文}，这些句子不再重复请求（断点续传）。
+        on_progress: 每完成一批后的回调 on_progress(results_dict)，用于增量写缓存。
+        任一批次重试后仍失败将抛出异常，由调用方中断后续流程。
+        """
+        n_total = len(sentences)
+        done = dict(done or {})
+        print(f"[翻译] 共 {n_total} 句，分批翻译（每批最多 {TRANSLATE_BATCH_SIZE} 句）...")
+
+        results: Dict[int, str] = dict(done)
+        for start in range(0, n_total, TRANSLATE_BATCH_SIZE):
+            batch_end = min(start + TRANSLATE_BATCH_SIZE, n_total)
+            todo = [i for i in range(start, batch_end) if i not in results]
+
+            if not todo:
+                print(f"[翻译] 批次 {start}-{batch_end - 1}: 全部命中缓存，跳过")
+                continue
+
+            # 只翻译缺失的句子（保留全局真实编号，避免续传时错位）
+            sub_sentences = [sentences[i] for i in todo]
+            prompt = self._build_prompt(sub_sentences, title, description, todo)
+
+            system_msg = "你是一位专业的视频字幕翻译师。你只输出合法的 JSON 数组，不输出任何其他内容。"
+            if self.supports_system_role:
+                messages = [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt},
+                ]
+            else:
+                messages = [{"role": "user", "content": system_msg + "\n\n" + prompt}]
+
+            batch_result: Dict[int, str] = {}
+            for attempt in range(1, MAX_RETRIES + 1):
+                content = self._chat(messages)
+                batch_result = self._parse_json_translations(content, todo[0], todo[-1] + 1)
+                missing = [i for i in todo if i not in batch_result]
+                if not missing:
+                    break
+                print(f"[警告] 批次 {todo[0]}-{todo[-1]}: 缺少 {len(missing)} 句译文 (id: {missing[:5]}...)，第 {attempt}/{MAX_RETRIES} 次重试...")
+
+            still_missing = [i for i in todo if i not in batch_result]
+            if still_missing:
+                # 重试后仍失败：硬性中断，不做占位降级
+                raise RuntimeError(
+                    f"批次 {todo[0]}-{todo[-1]} 有 {len(still_missing)} 句重试后仍翻译失败"
+                    f" (id: {still_missing[:5]}...)，已中断。"
+                    f"已完成部分已写入缓存，修复后重新运行可从断点继续。"
+                )
+
+            results.update(batch_result)
+            if on_progress:
+                on_progress(results)
+            print(f"[翻译] 进度: {batch_end}/{n_total}")
+
+        print(f"[翻译] 完成，共 {len(results)} 句")
+        return [results[i] for i in range(n_total)]
+
+    @staticmethod
+    def _parse_json_translations(content: str, id_start: int, id_end: int) -> Dict[int, str]:
+        """从 LLM 返回内容解析 [{"id": n, "zh": "..."}]，返回 {id: 译文}"""
+        text = content.strip()
+        # 剥离可能存在的 markdown 代码围栏
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text).strip()
+        begin = text.find("[")
+        end = text.rfind("]")
+        if begin == -1 or end == -1 or end <= begin:
+            return {}
+
+        try:
+            data = json.loads(text[begin:end + 1])
+        except json.JSONDecodeError:
+            return {}
+
+        result: Dict[int, str] = {}
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    idx = int(item["id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                zh = str(item.get("zh", "")).strip()
+                if zh and id_start <= idx < id_end:
+                    result[idx] = zh
+        return result
+
+    @staticmethod
+    def _build_prompt(sentences: List[Dict], title: str, description: str, ids: List[int]) -> str:
+        numbered_lines = "\n".join(
+            f"{ids[i]}. {s['text']}" for i, s in enumerate(sentences)
+        )
+        n = len(sentences)
+        description = (description or "").strip() or "（无简介）"
+
+        return f"""你是一位专业的视频字幕翻译师。请将以下视频字幕翻译成中文。
+
+视频标题：{title}
+视频简介：{description}
+
+以下是视频的一段字幕文本，每句前面有编号。请严格逐句翻译，不要合并或拆分句子，不要遗漏任何一句。译文应自然流畅，符合中文表达习惯，适合作为视频字幕。
+
+输出要求：只输出一个 JSON 数组，每个元素格式为 {{"id": 编号, "zh": "该句中文译文"}}。编号可能与其它批次重叠或看起来不连续，但必须与原句前面的编号完全一致，一个都不能改、不能漏。不要输出 markdown 代码块标记，不要输出任何解释。
+
+原文：
+{numbered_lines}
+
+中文译文（JSON 数组）："""
+
+    def translate_title(self, title: str, description: str = "") -> Optional[str]:
+        """翻译视频标题（用于最终视频文件命名），失败返回 None"""
+        if not title or title == "Unknown":
+            return None
+        prompt = (
+            "请把下面的视频标题翻译成简洁自然的中文，只输出译文本身，"
+            "不要引号、不要解释、不要保留原文。\n"
+            f"标题：{title}\n"
+        )
+        desc = (description or "").strip()
+        if desc:
+            prompt += f"（视频简介供参考：{desc[:200]}）\n"
+
+        content = self._chat([{"role": "user", "content": prompt}])
+        # 去掉可能存在的代码围栏，取第一行，再去掉包裹的引号
+        text = content.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text).strip()
+        text = text.splitlines()[0].strip().strip('"“”').strip()
+        return text or None
+
+
+# ==================== 字幕后处理 ====================
+
+def split_long_sentence(text: str, start_ms: int, end_ms: int, max_chars: int) -> List[Dict]:
+    """按逗号/顿号拆分长句"""
+    delimiters = ['，', '、', '；', ',', ';']
+
+    # 第一遍：按标点切成子句
+    clauses = []
+    last_end = 0
+    for i, char in enumerate(text):
+        if char in delimiters and i > 5:
+            clauses.append(text[last_end:i+1])
+            last_end = i + 1
+    if last_end < len(text):
+        clauses.append(text[last_end:])
+
+    # 第二遍：把子句打包到不超过 max_chars 的片段；单个子句本身超长则按字符硬切
+    parts = []
+    buffer = ""
+    for clause in clauses:
+        if len(clause) > max_chars:
+            if buffer:
+                parts.append(buffer)
+                buffer = ""
+            for j in range(0, len(clause), max_chars):
+                parts.append(clause[j:j+max_chars])
+        elif len(buffer) + len(clause) <= max_chars:
+            buffer += clause
+        else:
+            parts.append(buffer)
+            buffer = clause
+    if buffer:
+        parts.append(buffer)
+
+    if len(parts) <= 1:
+        return [{"text": text, "start_ms": start_ms, "end_ms": end_ms}]
+
+    total_chars = len(text)
+    results = []
+    current_ms = start_ms
+
+    # 时间下限不能超过总时长均摊值，否则会产生零/负时长字幕
+    available = max(end_ms - start_ms, 0)
+    min_gap = min(800, max(available // len(parts), 1))
+
+    for i, part in enumerate(parts):
+        if i == len(parts) - 1:
+            part_end = end_ms
+        else:
+            ratio = len(part) / total_chars
+            part_end = int(start_ms + available * ratio)
+            part_end = max(part_end, current_ms + min_gap)
+
+        results.append({"text": part.strip(), "start_ms": current_ms, "end_ms": part_end})
+        current_ms = part_end
+
+    return results
+
+
+def merge_short_subtitles(subs: List[Dict], min_duration: int, max_chars: int) -> List[Dict]:
+    """合并显示时间过短的字幕"""
+    if not subs:
+        return subs
+
+    merged = [subs[0]]
+    for current in subs[1:]:
+        prev = merged[-1]
+        prev_duration = prev["end_ms"] - prev["start_ms"]
+
+        if (prev_duration < min_duration and
+            len(prev["text"] + current["text"]) <= max_chars):
+            prev["text"] += current["text"]
+            prev["end_ms"] = current["end_ms"]
+        else:
+            merged.append(current)
+
+    return merged
+
+
+def postprocess_subtitles(sentences: List[Dict], translations: List[str],
+                          max_chars: int, min_duration: int, max_duration: int) -> List[Dict]:
+    """后处理"""
+    result = []
+
+    for sent, trans in zip(sentences, translations):
+        duration = sent["end_ms"] - sent["start_ms"]
+
+        if len(trans) > max_chars or duration > max_duration:
+            parts = split_long_sentence(trans, sent["start_ms"], sent["end_ms"], max_chars)
+            result.extend(parts)
+        else:
+            result.append({
+                "text": trans,
+                "start_ms": sent["start_ms"],
+                "end_ms": sent["end_ms"],
+            })
+
+    result = merge_short_subtitles(result, min_duration, max_chars)
+    return result
+
+
+# ==================== SRT 生成 ====================
+
+def generate_srt(subs: List[Dict], output_path: Path):
+    """生成 SRT 文件"""
+    with open(output_path, "w", encoding="utf-8") as f:
+        for i, sub in enumerate(subs, 1):
+            start = ms_to_srt_time(sub["start_ms"])
+            end = ms_to_srt_time(sub["end_ms"])
+            f.write(f"{i}\n")
+            f.write(f"{start} --> {end}\n")
+            f.write(f"{sub['text']}\n\n")
+
+    print(f"[SRT] 已生成: {output_path} ({len(subs)} 条字幕)")
+
+
+# ==================== 最终合成（字幕烧录 + 配音） ====================
+
+
+# ==================== 中文配音（TTS） ====================
+
+class TTSClient:
+    """统一 TTS 客户端"""
+
+    def __init__(self, config: Dict, llm_config: Dict):
+        self.engine = config.get("engine", "edge-tts")
+        self.enabled = config.get("enabled", True)
+        self.mix_with_original = config.get("mix_with_original", False)
+
+        if self.engine == "edge-tts":
+            self.voice = config.get("voice", "zh-CN-XiaoxiaoNeural")
+            self.rate = config.get("rate", "+0%")
+            self.volume = config.get("volume", "+0%")
+            self.pitch = config.get("pitch", "+0Hz")
+            print(f"[TTS] 引擎: edge-tts, 音色: {self.voice}")
+        elif self.engine == "mimo":
+            self.base_url = config.get("base_url", llm_config.get("base_url", ""))
+            self.api_key = config.get("api_key", llm_config.get("api_key", ""))
+            self.model = config.get("model", "mimo-v2.5-tts")
+            self.voice = config.get("voice", "茉莉")
+            self.style = config.get("style", "")
+
+            base_url = self.base_url.rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url += "/v1"
+
+            self.client = OpenAI(api_key=self.api_key, base_url=base_url, timeout=120)
+            print(f"[TTS] 引擎: MiMo TTS, 模型: {self.model}, 音色: {self.voice}")
+        else:
+            raise ValueError(f"不支持的 TTS 引擎: {self.engine}")
+
+    async def generate_all(self, subs: List[Dict], output_dir: Path) -> List[Path]:
+        """为所有字幕生成 TTS 音频，返回音频文件路径列表"""
+        if not self.enabled:
+            return []
+
+        print(f"[TTS] 开始生成 {len(subs)} 条配音...")
+
+        if self.engine == "edge-tts":
+            return await self._generate_edge_tts(subs, output_dir)
+        else:
+            return await self._generate_mimo_tts(subs, output_dir)
+
+    async def _generate_edge_tts(self, subs: List[Dict], output_dir: Path) -> List[Path]:
+        """使用 edge-tts 生成配音"""
+        import edge_tts
+
+        semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
+
+        slots = compute_tts_slots(subs)
+
+        async def generate_one(idx: int, text: str) -> Path:
+            # 注意：edge-tts 实际输出 mp3 格式（ffmpeg 会自动识别，扩展名不影响使用）
+            output_path = output_dir / f"tts_{idx:04d}.mp3"
+            async with semaphore:
+                for attempt in range(1, MAX_RETRIES + 1):
+                    try:
+                        communicate = edge_tts.Communicate(
+                            text, self.voice,
+                            rate=self.rate,
+                            volume=self.volume,
+                            pitch=self.pitch,
+                        )
+                        await communicate.save(str(output_path))
+                        # 若配音超过时间槽，加速以避免压到下一句
+                        fit_tts_duration(output_path, slots[idx])
+                        return output_path
+                    except Exception as e:
+                        if attempt == MAX_RETRIES:
+                            raise
+                        wait = 2 ** attempt
+                        print(f"[TTS] 第 {idx} 条生成失败 (第 {attempt}/{MAX_RETRIES} 次): {e}，{wait}s 后重试...")
+                        await asyncio.sleep(wait)
+
+        tasks = [generate_one(i, sub["text"]) for i, sub in enumerate(subs)]
+        results = await asyncio.gather(*tasks)
+        print(f"[TTS] edge-tts 配音生成完成")
+        return results
+
+    async def _generate_mimo_tts(self, subs: List[Dict], output_dir: Path) -> List[Path]:
+        """使用 MiMo TTS 生成配音"""
+
+        slots = compute_tts_slots(subs)
+
+        def generate_one(idx: int, text: str) -> Path:
+            output_path = output_dir / f"tts_{idx:04d}.wav"
+
+            messages = []
+            if self.style:
+                messages.append({"role": "user", "content": self.style})
+            messages.append({"role": "assistant", "content": text})
+
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                audio={"format": "wav", "voice": self.voice},
+            )
+
+            # 提取 base64 音频数据
+            audio_data = response.choices[0].message.audio.data
+            audio_bytes = base64.b64decode(audio_data)
+
+            with open(output_path, "wb") as f:
+                f.write(audio_bytes)
+
+            fit_tts_duration(output_path, slots[idx])
+            return output_path
+
+        # MiMo TTS 是同步 HTTP 请求，用线程池并行
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [
+                loop.run_in_executor(executor, generate_one, i, sub["text"])
+                for i, sub in enumerate(subs)
+            ]
+            results = await asyncio.gather(*futures)
+
+        print(f"[TTS] MiMo TTS 配音生成完成")
+        return results
+
+
+def mix_tts_audio(subs: List[Dict], tts_files: List[Path], output_audio: Path):
+    """将所有 TTS 音频片段按时间轴拼接成完整音轨（numpy 实现，替代 amix 滤镜）"""
+    if not subs or not tts_files:
+        return
+
+    try:
+        import numpy as np
+    except ImportError:
+        raise RuntimeError("音频拼接需要 numpy，请先安装: pip install numpy")
+
+    clips = []
+    total_samples = SAMPLE_RATE  # 至少留 1 秒尾部
+    for sub, f in zip(subs, tts_files):
+        pcm = _decode_to_pcm16(f)
+        offset = int(sub.get("start_ms", 0)) * SAMPLE_RATE // 1000
+        clips.append((offset, pcm))
+        total_samples = max(total_samples, offset + len(pcm) + SAMPLE_RATE)
+
+    master = np.zeros(total_samples, dtype=np.int16)
+    for offset, pcm in clips:
+        seg = master[offset:offset + len(pcm)].astype(np.int32) + pcm.astype(np.int32)
+        master[offset:offset + len(pcm)] = np.clip(seg, -32768, 32767).astype(np.int16)
+
+    with wave.open(str(output_audio), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(master.tobytes())
+
+    print(f"[音频] 已拼接 {len(clips)} 条配音: {output_audio}")
+
+
+def _decode_to_pcm16(path: Path):
+    """用 ffmpeg 把任意音频解码为 48kHz 单声道 s16le PCM，返回 numpy 数组"""
+    import numpy as np
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(path),
+           "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "pipe:1"]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"音频解码失败: {path}\n{result.stderr.decode(errors='ignore')}")
+    return np.frombuffer(result.stdout, dtype=np.int16)
+
+
+def compute_tts_slots(subs: List[Dict]) -> List[int]:
+    """计算每条字幕可用于配音的时间槽长度（ms）：到下一条字幕开始为止"""
+    slots = []
+    for i, sub in enumerate(subs):
+        if i < len(subs) - 1:
+            slot = subs[i + 1]["start_ms"] - sub["start_ms"]
+        else:
+            slot = max(sub["end_ms"] - sub["start_ms"], 3000)
+        slots.append(max(int(slot), 500))
+    return slots
+
+
+def probe_duration_ms(path: Path) -> Optional[int]:
+    """用 ffprobe 探测音频时长（ms），失败返回 None"""
+    if not shutil.which("ffprobe"):
+        return None
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True,
+    )
+    try:
+        return int(float(result.stdout.strip()) * 1000)
+    except ValueError:
+        return None
+
+
+def fit_tts_duration(path: Path, max_len_ms: int):
+    """若配音超过可用时间槽，用 atempo 加速（最高 TTS_MAX_TEMPO 倍），避免压到下一句"""
+    dur_ms = probe_duration_ms(path)
+    if dur_ms is None or dur_ms <= max_len_ms:
+        return
+
+    tempo = min(dur_ms / max(max_len_ms * 0.98, 1), TTS_MAX_TEMPO)
+    tmp_path = path.with_suffix(".fitted" + path.suffix)
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(path),
+           "-filter:a", f"atempo={tempo:.4f}", str(tmp_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode == 0 and tmp_path.exists():
+        tmp_path.replace(path)
+        print(f"[TTS] 配音过长 ({dur_ms}ms > {max_len_ms}ms)，已加速 {tempo:.2f}x")
+    else:
+        tmp_path.unlink(missing_ok=True)
+        print(f"[TTS] 时长调整失败，保留原始配音: {result.stderr}", file=sys.stderr)
+
+
+
+
+def _escape_filter_path(p: Path) -> str:
+    """转义并包裹 FFmpeg 滤镜参数中的路径（处理盘符冒号、反斜杠、空格与引号）。
+
+    用单引号包裹后，路径中的空格、冒号都会被当作字面量处理；
+    内部的单引号用 '\'' 序列转义（关闭引号→转义引号→重新开启）。
+    """
+    s = str(p).replace("\\", "/").replace("'", "'\\''")
+    return f"'{s}'"
+
+
+def compose_final_video(video_path: Path, srt_path: Optional[Path],
+                        audio_path: Optional[Path], output_path: Path,
+                        mix_with_original: bool = False) -> bool:
+    """一步完成字幕烧录（可选）和配音替换/混合（可选），只做一次视频转码"""
+    if not shutil.which("ffmpeg"):
+        print("[警告] 未找到 ffmpeg，跳过最终合成")
+        return False
+
+    sub_style = "FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=0,MarginV=50"
+    cmd = ["ffmpeg", "-y", "-i", str(video_path)]
+
+    if srt_path and audio_path:
+        # 字幕 + 配音一起处理：视频走滤镜烧录，音频来自配音文件
+        sub_filter = f"subtitles={_escape_filter_path(srt_path)}:force_style='{sub_style}'"
+        cmd.extend(["-i", str(audio_path)])
+        if mix_with_original:
+            # 保留原音，按权重混合（weights 含空格，必须加单引号）
+            fc = (f"[0:v]{sub_filter}[v];"
+                  f"[0:a][1:a]amix=inputs=2:duration=first:normalize=0:weights='0.3 0.7'[a]")
+            cmd.extend(["-filter_complex", fc, "-map", "[v]", "-map", "[a]"])
+        else:
+            fc = f"[0:v]{sub_filter}[v]"
+            cmd.extend(["-filter_complex", fc, "-map", "[v]", "-map", "1:a"])
+        cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "192k"])
+    elif srt_path:
+        # 只烧录字幕
+        sub_filter = f"subtitles={_escape_filter_path(srt_path)}:force_style='{sub_style}'"
+        cmd.extend(["-vf", sub_filter,
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "192k"])
+    elif audio_path:
+        # 只替换配音（--no-burn），无需重编码视频。
+        # 不加 -shortest：配音比视频短时会把视频尾部截掉，宁可尾部留白静音
+        cmd.extend(["-i", str(audio_path),
+                    "-map", "0:v", "-map", "1:a",
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k"])
+    else:
+        print("[警告] 没有需要合成的内容")
+        return False
+
+    cmd.append(str(output_path))
+
+    print(f"[FFmpeg] 正在合成最终视频...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"[FFmpeg 错误] {result.stderr}", file=sys.stderr)
+        return False
+
+    print(f"[FFmpeg] 最终视频完成: {output_path}")
+    return True
+
+
+# ==================== 主流程 ====================
+
+def main():
+    parser = argparse.ArgumentParser(description="YouTube 视频自动下载 + 中文字幕生成 + 中文配音")
+    parser.add_argument("url", help="YouTube 视频 URL")
+    parser.add_argument("-o", "--output", default="./youtube_downloads", help="根输出目录")
+    parser.add_argument("--config", default=None, help="配置文件路径 (默认: 脚本同目录下的 config.json)")
+    parser.add_argument("--no-video", action="store_true", help="只下载字幕，不下载视频")
+    parser.add_argument("--no-burn", action="store_true", help="跳过烧录字幕到视频")
+    parser.add_argument("--no-tts", action="store_true", help="跳过中文配音")
+    parser.add_argument("--lang", default=None, help="强制指定语言代码（如 en, ja, zh-CN）")
+
+    args = parser.parse_args()
+
+    # 加载配置
+    config_path = Path(args.config) if args.config else None
+    config = load_config(config_path)
+
+    llm_config = config["llm"]
+    tts_config = config["tts"]
+    sub_config = config["subtitle"]
+
+    # 用视频 ID 作为输出目录
+    video_id = extract_video_id(args.url)
+    output_dir = Path(args.output) / video_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[输出目录] {output_dir}")
+
+    try:
+        # 步骤 1: 获取元数据 + 检测语言
+        print("=" * 60)
+        print("步骤 1: 获取视频元数据")
+        print("=" * 60)
+        metadata = get_video_metadata(args.url)
+        title = metadata.get("title", "Unknown")
+        description = metadata.get("description", "")
+
+        if args.lang:
+            lang = args.lang
+            print(f"[语言] 用户强制指定: {lang}")
+        else:
+            lang = detect_default_language(metadata)
+
+        # 提前初始化，避免 --no-video 模式下引用未定义变量导致 NameError
+        video_path = None
+        thumbnail_path = None
+
+        # 步骤 2: 下载视频和字幕
+        print("\n" + "=" * 60)
+        print("步骤 2: 下载视频和 JSON3 字幕")
+        print("=" * 60)
+
+        if args.no_video:
+            template = str(output_dir / "%(id)s")
+            result = run_yt_dlp([
+                "--write-auto-subs", "--write-subs",
+                "--sub-langs", lang,
+                "--sub-format", "json3",
+                "--write-thumbnail",
+                "--convert-thumbnails", "jpg",
+                "--skip-download",
+                "-o", template,
+                args.url,
+            ])
+
+            sub_path = None
+            for f in output_dir.iterdir():
+                if f.suffix == ".json3" and video_id in f.name:
+                    sub_path = f
+                    break
+            if sub_path is None:
+                raise FileNotFoundError("未找到下载的字幕文件")
+            video_path = None
+        else:
+            video_path, sub_path, thumbnail_path, _ = download_video_and_subs(args.url, output_dir, lang)
+
+        # 步骤 3: 解析 JSON3
+        print("\n" + "=" * 60)
+        print("步骤 3: 解析词级字幕")
+        print("=" * 60)
+        words = parse_json3(sub_path)
+
+        # 步骤 4: 按标点分句
+        print("\n" + "=" * 60)
+        print("步骤 4: 按标点分句")
+        print("=" * 60)
+        sentences = split_into_sentences(words)
+
+        for i, s in enumerate(sentences[:3]):
+            print(f"  句{i+1}: [{ms_to_srt_time(s['start_ms'])}] {s['text'][:60]}...")
+
+        # 步骤 5: LLM 翻译（逐批写缓存，中断后重跑自动断点续传）
+        print("\n" + "=" * 60)
+        print("步骤 5: LLM 翻译")
+        print("=" * 60)
+        llm = LLMClient(llm_config)
+        translations = None
+        cache_path = output_dir / f"{video_id}_translations.json"
+        source_sha = hashlib.sha1(
+            "\n".join(s["text"] for s in sentences).encode("utf-8")
+        ).hexdigest()
+
+        def save_cache(res: Dict[int, str]):
+            """把当前进度写入缓存（未完成的句子存为 null，便于断点续传）"""
+            sparse = [res.get(i) for i in range(len(sentences))]
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "model": llm.model,
+                    "source_sha": source_sha,
+                    "count": len(sentences),
+                    "complete": all(t is not None for t in sparse),
+                    "translations": sparse,
+                }, f, ensure_ascii=False, indent=1)
+
+        done_map: Dict[int, str] = {}
+        if cache_path.exists():
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+                if (cache.get("model") == llm.model
+                        and cache.get("source_sha") == source_sha
+                        and isinstance(cache.get("translations"), list)):
+                    for i, t in enumerate(cache["translations"][:len(sentences)]):
+                        if isinstance(t, str) and t.strip():
+                            done_map[i] = t
+                    if done_map:
+                        print(f"[翻译] 从缓存恢复 {len(done_map)}/{len(sentences)} 句译文: {cache_path}")
+                    if len(done_map) == len(sentences):
+                        translations = [done_map[i] for i in range(len(sentences))]
+                        print("[翻译] 命中完整缓存，跳过 API 调用")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if translations is None:
+            translations = llm.translate(sentences, title, description,
+                                         done=done_map, on_progress=save_cache)
+            save_cache({i: t for i, t in enumerate(translations)})
+            print(f"[翻译] 结果已缓存: {cache_path}")
+
+        # 步骤 5.5: 翻译视频标题（用于最终视频文件命名，同样写入缓存）
+        title_zh = None
+        if cache_path.exists():
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    t = json.load(f).get("title_zh")
+                if isinstance(t, str) and t.strip():
+                    title_zh = t.strip()
+            except (json.JSONDecodeError, OSError):
+                title_zh = None
+        if title_zh is None:
+            try:
+                title_zh = llm.translate_title(title, description)
+                if title_zh:
+                    # 合并写入缓存文件，下次重跑不再重新翻译
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        cache_data = json.load(f)
+                    cache_data["title_zh"] = title_zh
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        json.dump(cache_data, f, ensure_ascii=False, indent=1)
+                    print(f"[标题] 中文标题: {title_zh}")
+            except Exception as e:
+                print(f"[警告] 标题翻译失败，将使用原标题命名: {e}", file=sys.stderr)
+                title_zh = None
+
+        for i, t in enumerate(translations[:3]):
+            print(f"  译{i+1}: {t[:60]}...")
+
+        # 步骤 6: 后处理 + 生成 SRT
+        print("\n" + "=" * 60)
+        print("步骤 6: 生成中文字幕 SRT")
+        print("=" * 60)
+        subs = postprocess_subtitles(
+            sentences, translations,
+            sub_config["max_chars_per_line"],
+            sub_config["min_duration_ms"],
+            sub_config["max_duration_ms"],
+        )
+        srt_path = output_dir / f"{video_id}_zh.srt"
+        generate_srt(subs, srt_path)
+
+        # 步骤 7: 合成最终视频（字幕烧录 + 中文配音一步完成，只做一次视频转码）
+        final_path = None
+        if video_path and not args.no_video and (not args.no_burn or not args.no_tts):
+            print("\n" + "=" * 60)
+            print("步骤 7: 合成最终视频（字幕烧录 + 中文配音）")
+            print("=" * 60)
+
+            want_burn = not args.no_burn
+            want_tts = not args.no_tts
+            tts = None
+            tts_files = None
+            mixed_audio = None
+
+            if want_tts:
+                tts = TTSClient(tts_config, llm_config)
+                if tts.enabled:
+                    # 生成所有 TTS 音频片段（自动按时间槽调速）
+                    tts_files = asyncio.run(tts.generate_all(subs, output_dir))
+                    if tts_files:
+                        mixed_audio = output_dir / f"{video_id}_zh_dub.wav"
+                        mix_tts_audio(subs, tts_files, mixed_audio)
+
+            if want_burn or mixed_audio:
+                final_name = sanitize_filename(title_zh or title) or video_id
+                final_path = output_dir / f"{final_name}.mp4"
+                print(f"[输出] 最终视频命名: {final_name}.mp4")
+                ok = compose_final_video(
+                    video_path,
+                    srt_path if want_burn else None,
+                    mixed_audio,
+                    final_path,
+                    mix_with_original=bool(tts and tts.mix_with_original),
+                )
+                if not ok:
+                    final_path = None
+                else:
+                    print(f"[完成] 最终成品: {final_path}")
+
+            # 清理临时文件
+            if tts_files:
+                for f in tts_files:
+                    f.unlink(missing_ok=True)
+            if mixed_audio:
+                mixed_audio.unlink(missing_ok=True)
+
+        # 完成
+        print("\n" + "=" * 60)
+        print("全部完成！")
+        print("=" * 60)
+        print(f"字幕文件: {srt_path}")
+        if video_path:
+            print(f"视频文件: {video_path}")
+        if thumbnail_path:
+            print(f"封面图片: {thumbnail_path}")
+        if final_path:
+            print(f"最终视频: {final_path}")
+
+    except Exception as e:
+        print(f"\n[错误] {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
