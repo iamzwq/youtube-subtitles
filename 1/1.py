@@ -4,30 +4,14 @@
 YouTube 视频自动下载 + 词级字幕翻译 + 纯中文 SRT 字幕生成 + 中文配音
 
 功能：
-1. 自动检测视频默认语言
+1. 从视频元数据生成字幕语言候选列表（由 yt-dlp 自动匹配实际存在的轨道）
 2. 下载视频 + JSON3 词级字幕（输出目录为视频ID）
 3. 解析字幕 → 按标点分句 → 记录每句首尾词时间
 4. 调用 LLM 整篇翻译（带标题/简介上下文）
 5. 时间对齐 → 生成纯中文 SRT 字幕
 6. 中文配音：支持 edge-tts（免费）或 MiMo TTS（高质量），自动按时间槽调速
-7. 字幕烧录 + 配音一步合成最终视频（--no-burn / --no-tts 可分别跳过）
+7. 字幕烧录 + 配音一步合成最终视频（--no-tts 可跳过配音）
 8. 翻译结果本地缓存（逐批保存），中断后重跑自动断点续传
-
-用法：
-    python youtube_subtitle_translator.py "https://www.youtube.com/watch?v=xxxxx"
-
-    # 指定配置文件
-    python youtube_subtitle_translator.py "URL" --config ./my_config.json
-
-    # 跳过烧录字幕
-    python youtube_subtitle_translator.py "URL" --no-burn
-
-    # 跳过配音
-    python youtube_subtitle_translator.py "URL" --no-tts
-
-依赖：
-    pip install yt-dlp openai edge-tts numpy
-    # 以及系统安装 ffmpeg / ffprobe
 """
 
 import argparse
@@ -41,7 +25,6 @@ import subprocess
 import sys
 import time
 import wave
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
@@ -76,13 +59,13 @@ DEFAULT_CONFIG = {
 
 SENTENCE_END_PUNCT = {'.', '!', '?', '。', '！', '？', '…'}
 
-# 可朗读字符：字母、数字、中日韩文字
-SPEAKABLE_CHAR_RE = re.compile(r'[a-zA-Z0-9\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff66-\uff9f]')
-
-
 def has_speakable_text(text: str) -> bool:
-    """判断文本是否含有可朗读的内容（纯标点/空白/符号的文本无法合成语音）"""
-    return bool(SPEAKABLE_CHAR_RE.search(text or ""))
+    """判断文本是否含有可朗读的内容（纯标点/空白/符号的文本无法合成语音）。
+
+    用 Unicode 字母/数字判断，天然覆盖所有语言（拉丁、中日韩、韩文、西里尔等），
+    避免手工枚举区段遗漏（如韩文）导致整片句子被误判为不可朗读而丢弃。
+    """
+    return any(ch.isalnum() for ch in (text or ""))
 
 TRANSLATE_BATCH_SIZE = 40   # 每批发送给 LLM 翻译的句子数（防止长视频超出 max_tokens 被截断）
 MAX_RETRIES = 3             # 网络 API 最大重试次数
@@ -91,10 +74,9 @@ TTS_MAX_TEMPO = 3.0         # 配音加速上限（倍速）
 SAMPLE_RATE = 48000         # 拼接音轨的采样率
 
 
-def load_config(config_path: Optional[Path] = None) -> Dict:
-    """加载配置文件，支持 JSON 格式"""
-    if config_path is None:
-        config_path = Path(__file__).parent / "config.json"
+def load_config() -> Dict:
+    """加载脚本同目录下的 config.json 配置文件；不存在则生成模板并退出"""
+    config_path = Path(__file__).parent / "config.json"
 
     config = json.loads(json.dumps(DEFAULT_CONFIG))  # 深拷贝
 
@@ -172,6 +154,25 @@ def extract_video_id(url: str) -> str:
     raise ValueError(f"无法从 URL 提取视频 ID: {url}")
 
 
+def strip_code_fence(text: str) -> str:
+    """剥离 LLM 输出中可能存在的 markdown 代码围栏"""
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    return text
+
+
+def read_json_safe(path: Path) -> Optional[dict]:
+    """读取 JSON 文件并返回 dict；文件不存在、解析失败或不是对象时返回 None"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 # ==================== yt-dlp 相关 ====================
 
 def sanitize_filename(name: str, max_len: int = 60) -> str:
@@ -181,10 +182,50 @@ def sanitize_filename(name: str, max_len: int = 60) -> str:
     return cleaned[:max_len].strip()
 
 
-def run_yt_dlp(args: List[str]) -> subprocess.CompletedProcess:
-    """运行 yt-dlp 命令"""
+def _stream_subprocess(cmd: List[str], label: str) -> Tuple[int, str]:
+    """运行子进程并实时把合并后的 stdout/stderr 转发到控制台。
+
+    按 \\r 或 \\n 切分逐行打印（兼容 ffmpeg 用 \\r 刷新的进度行）。
+    返回 (returncode, 尾部输出文本)，供失败时报告错误详情。
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    tail: List[str] = []
+    buf = ""
+    while True:
+        chunk = proc.stdout.read1(4096)  # 有多少读多少，保证实时
+        if not chunk:
+            break
+        buf += chunk.decode("utf-8", errors="replace")
+        *lines, buf = re.split(r"[\r\n]", buf)
+        for line in lines:
+            line = line.strip()
+            if line:
+                print(f"[{label}] {line}")
+                tail.append(line)
+                if len(tail) > 60:
+                    del tail[:-60]
+    if buf.strip():
+        print(f"[{label}] {buf.strip()}")
+        tail.append(buf.strip())
+    code = proc.wait()
+    return code, "\n".join(tail)
+
+
+def run_yt_dlp(args: List[str], stream: bool = False) -> subprocess.CompletedProcess:
+    """运行 yt-dlp 命令。
+
+    stream=True 时实时转发下载日志到控制台（返回值的 stderr 仅含尾部输出）；
+    默认静默捕获全部输出（--dump-json 需要解析完整 stdout，必须用默认模式）。
+    """
     cmd = ["yt-dlp"] + args
     print(f"[yt-dlp] {' '.join(cmd)}")
+    if stream:
+        code, tail = _stream_subprocess(cmd, "yt-dlp")
+        return subprocess.CompletedProcess(cmd, code, stdout="", stderr=tail)
     result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         print(f"[yt-dlp stderr] {result.stderr}", file=sys.stderr)
@@ -200,123 +241,103 @@ def get_video_metadata(url: str) -> Dict:
     return json.loads(first_line)
 
 
-def _resolve_available_track(lang: Optional[str], available: set, subtitles_info: Dict = None) -> Optional[str]:
-    """把语言代码匹配到实际存在的字幕轨道。
+def detect_sub_langs(metadata: Dict) -> str:
+    """构造 yt-dlp 的 --sub-langs 候选串（逗号分隔）。
 
-    匹配顺序：精确匹配 > xx-orig > 去掉区域后缀的基础语言 > 基础语言的 xx-orig。
-    如果多个候选都存在，优先选择有 json3 格式的轨道（避免下载到纯 vtt 无法解析词级时间戳）。
+    按优先级列出候选：元数据语言 > 其 -orig 变体 > 去区域后缀的基础语言 > 基础语言的 -orig。
+    yt-dlp 会自动跳过不存在的轨道，因此无需预先解析出唯一精确的轨道名
+    （例如元数据标记 en-US 但只有 en 轨道时，候选串中的 en 自然命中）。
     """
-    if not lang or lang in ("none", "und", ""):
-        return None
-    candidates = [
-        lang,
-        f"{lang}-orig",
-        lang.split("-")[0],
-        f"{lang.split('-')[0]}-orig",
-    ]
+    lang = (metadata.get("language") or "").strip()
+    cands: List[str] = []
+    if lang and lang not in ("none", "und"):
+        base = lang.split("-")[0]
+        cands += [lang, f"{lang}-orig", base, f"{base}-orig"]
+    else:
+        # 元数据没有语言信息时，从字幕轨道列表推断（-orig 即原始 ASR 轨道）
+        tracks = set(metadata.get("automatic_captions") or {}) | set(metadata.get("subtitles") or {})
+        origs = sorted(k for k in tracks if k.endswith("-orig"))
+        if origs:
+            base = origs[0].split("-")[0]
+            cands = [base, origs[0]]
+        elif tracks:
+            cands = [sorted(tracks)[0]]
+
+    if not cands:
+        print("[语言] 无法从元数据判断，回退到 en")
+        cands = ["en"]
+
     # 去重，保留顺序
-    seen = set()
+    seen: set = set()
     unique = []
-    for c in candidates:
+    for c in cands:
         if c not in seen:
-            seen.add(c); unique.append(c)
-
-    def has_json3(track: str) -> bool:
-        """检查该轨道是否支持 json3 格式"""
-        if not subtitles_info:
-            return True  # 无格式信息时假设可用
-        track_info = subtitles_info.get(track, {})
-        if isinstance(track_info, list):
-            formats = track_info
-        elif isinstance(track_info, dict):
-            formats = track_info.get("formats", track_info.get("ext", []))
-        else:
-            formats = []
-        return any("json3" in str(f) for f in formats)
-
-    # 优先选有 json3 的候选
-    for cand in unique:
-        if cand in available and has_json3(cand):
-            return cand
-    # 没有任何 json3 候选时，退而求其次选第一个存在的
-    for cand in unique:
-        if cand in available:
-            return cand
-    return None
+            seen.add(c)
+            unique.append(c)
+    return ",".join(unique)
 
 
-def detect_default_language(metadata: Dict) -> str:
-    """检测视频默认语言（必须与实际可用的字幕轨道对齐）"""
-    auto_caps = metadata.get("automatic_captions", {})
-    manual_subs = metadata.get("subtitles", {})
-    available = set(auto_caps) | set(manual_subs)
+def find_downloaded_sub(output_dir: Path, video_id: str, prefer: str) -> Optional[Path]:
+    """在输出目录查找已下载的 json3 字幕文件。
 
-    # 先尝试元数据标记的语言，但必须校验该语言的字幕轨道真实存在
-    # 只看自动字幕格式（下载优先用 --write-auto-subs）
-    resolved = _resolve_available_track(metadata.get("language"), available, auto_caps)
-    if resolved:
-        print(f"[语言检测] 视频元数据标记的语言: {metadata['language']} -> 字幕轨道: {resolved}")
-        return resolved
+    遍历顺序经排序以保证结果确定；优先选择文件名中含偏好语言码（如 en）的文件。
+    若存在多个 json3 文件，只会选用其中一个并在日志中说明，其余文件保留在磁盘上。
+    """
+    matches = []
+    for f in sorted(output_dir.iterdir()):
+        if f.suffix.lower() != ".json3" or not f.stem.startswith(video_id):
+            continue
+        matches.append(f)
+    if not matches:
+        return None
 
-    if auto_caps:
-        # 优先选择带 -orig 后缀的原始 ASR 轨道，避免误选到翻译语言
-        orig_keys = [k for k in auto_caps if k.endswith("-orig")]
-        first_lang = orig_keys[0] if orig_keys else list(auto_caps.keys())[0]
-        print(f"[语言检测] 从自动字幕列表推断: {first_lang}")
-        return first_lang
+    found = None
+    for f in matches:
+        if prefer in f.name or found is None:
+            if found is None or (prefer in f.name and prefer not in found.name):
+                found = f
 
-    manual_subs = metadata.get("subtitles", {})
-    if manual_subs:
-        first_lang = list(manual_subs.keys())[0]
-        print(f"[语言检测] 从手动字幕列表推断: {first_lang}")
-        return first_lang
-
-    print("[语言检测] 无法检测语言，fallback 到 en")
-    return "en"
+    if len(matches) > 1:
+        others = ", ".join(m.name for m in matches if m != found)
+        print(f"[下载] 发现 {len(matches)} 个 json3 文件，选用: {found.name}（忽略: {others}）")
+    return found
 
 
-def download_video_and_subs(url: str, output_dir: Path, lang: str) -> Tuple[Path, Path, Optional[Path], Dict]:
-    """下载视频和 JSON3 字幕"""
+def download_video_and_subs(url: str, output_dir: Path, sub_langs: str,
+                            metadata: Dict) -> Tuple[Path, Path, Optional[Path], Dict]:
+    """下载视频和 JSON3 字幕（metadata 由调用方传入，避免重复执行 yt-dlp 获取元数据）"""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    metadata = get_video_metadata(url)
     video_id = metadata["id"]
     title = metadata.get("title", "unknown")
 
     print(f"[下载] 视频标题: {title}")
     print(f"[下载] 视频ID: {video_id}")
-    print(f"[下载] 目标语言: {lang}")
+    print(f"[下载] 字幕语言候选: {sub_langs}")
 
     template = str(output_dir / "%(id)s")
 
-    result = run_yt_dlp([
-        "-f", "bestvideo*+bestaudio/best",
-        "--write-auto-subs",
-        "--sub-langs", lang,
-        "--sub-format", "json3",
-        "--write-thumbnail",
-        "--convert-thumbnails", "jpg",
-        "-o", template,
-        url,
-    ])
-
-    if result.returncode != 0:
-        print(f"[下载] 自动字幕下载失败，尝试手动字幕...")
-        result = run_yt_dlp([
+    def build_ytdlp_cmd(sub_flag: str) -> List[str]:
+        """构造 yt-dlp 下载命令（自动字幕失败后换 --write-subs 重试）"""
+        return [
             "-f", "bestvideo*+bestaudio/best",
-            "--write-subs",
-            "--sub-langs", lang,
+            sub_flag,
+            "--sub-langs", sub_langs,
             "--sub-format", "json3",
             "--write-thumbnail",
             "--convert-thumbnails", "jpg",
             "-o", template,
             url,
-        ])
+        ]
+
+    result = run_yt_dlp(build_ytdlp_cmd("--write-auto-subs"), stream=True)
+    if result.returncode != 0:
+        print("[下载] 自动字幕下载失败，尝试手动字幕...")
+        result = run_yt_dlp(build_ytdlp_cmd("--write-subs"), stream=True)
         if result.returncode != 0:
             raise RuntimeError(f"字幕下载失败: {result.stderr}")
 
     video_path = None
-    sub_path = None
     thumbnail_path = None
 
     for f in output_dir.iterdir():
@@ -331,18 +352,19 @@ def download_video_and_subs(url: str, output_dir: Path, lang: str) -> Tuple[Path
             if video_path is None or len(f.stem) < len(video_path.stem):
                 # 优先选择文件名恰好等于视频 ID 的原始下载文件
                 video_path = f
-        elif suffix == ".json3":
-            if lang in f.name or sub_path is None:
-                if sub_path is None or (lang in f.name and lang not in sub_path.name):
-                    sub_path = f
         elif suffix in (".jpg", ".jpeg", ".png", ".webp"):
             if thumbnail_path is None or suffix == ".jpg":
                 thumbnail_path = f
 
+    preferred = sub_langs.split(",")[0].split("-")[0]
+    sub_path = find_downloaded_sub(output_dir, video_id, preferred)
     if video_path is None:
         raise FileNotFoundError(f"未找到下载的视频文件 (ID: {video_id})")
     if sub_path is None:
-        raise FileNotFoundError(f"未找到下载的字幕文件 (语言: {lang})")
+        # SystemExit 不被 main 的 except Exception 捕获，直接退出且不带堆栈
+        raise SystemExit(
+            f"[错误] 未找到 json3 字幕文件（语言候选: {sub_langs}）。\n"
+            "       该视频可能不提供 json3 格式的字幕，而本脚本依赖词级时间戳，无法继续。")
 
     print(f"[下载完成] 视频: {video_path}")
     print(f"[下载完成] 字幕: {sub_path}")
@@ -405,44 +427,31 @@ def parse_json3(json3_path: Path) -> List[Dict]:
 
 def split_into_sentences(words: List[Dict]) -> List[Dict]:
     """按标点分句"""
-    sentences = []
-    current_words = []
-    start_idx = 0
+    def make_sentence(ws: List[Dict]) -> Optional[Dict]:
+        """把一组词组装成句子；纯标点/无实际内容的片段（如独立的 "..."）返回 None 丢弃"""
+        text = "".join(w["text"] for w in ws).strip()
+        if not has_speakable_text(text):
+            return None
+        return {
+            "text": text,
+            "words": ws,
+            "start_ms": ws[0]["start_ms"],
+            "end_ms": ws[-1]["end_ms"],
+        }
 
-    for i, word in enumerate(words):
-        text = word["text"]
+    for word in words:
         current_words.append(word)
-
-        stripped = text.rstrip()
+        stripped = word["text"].rstrip()
         if stripped and stripped[-1] in SENTENCE_END_PUNCT:
-            sentence_text = "".join(w["text"] for w in current_words).strip()
-            # 纯标点/无实际内容的片段（如独立的 "..."）不成句，直接丢弃
-            if has_speakable_text(sentence_text):
-                sentences.append({
-                    "text": sentence_text,
-                    "words": current_words,
-                    "start_ms": current_words[0]["start_ms"],
-                    "end_ms": current_words[-1]["end_ms"],
-                    "start_idx": start_idx,
-                    "end_idx": i,
-                })
-                start_idx = i + 1
-            else:
-                # 被丢弃的片段不重置 start_idx，时间轴归入下一句
-                pass
+            sent = make_sentence(current_words)
+            if sent:
+                sentences.append(sent)
+            # 被丢弃片段的时间轴自然归入下一句（current_words 直接清空即可）
             current_words = []
 
-    if current_words:
-        sentence_text = "".join(w["text"] for w in current_words).strip()
-        if has_speakable_text(sentence_text):
-            sentences.append({
-                "text": sentence_text,
-                "words": current_words,
-                "start_ms": current_words[0]["start_ms"],
-                "end_ms": current_words[-1]["end_ms"],
-                "start_idx": start_idx,
-                "end_idx": len(words) - 1,
-            })
+    sent = make_sentence(current_words) if current_words else None
+    if sent:
+        sentences.append(sent)
 
     print(f"[分句] 共 {len(sentences)} 句")
     return sentences
@@ -554,11 +563,7 @@ class LLMClient:
     @staticmethod
     def _parse_json_translations(content: str, id_start: int, id_end: int) -> Dict[int, str]:
         """从 LLM 返回内容解析 [{"id": n, "zh": "..."}]，返回 {id: 译文}"""
-        text = content.strip()
-        # 剥离可能存在的 markdown 代码围栏
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text).strip()
+        text = strip_code_fence(content)
         begin = text.find("[")
         end = text.rfind("]")
         if begin == -1 or end == -1 or end <= begin:
@@ -588,7 +593,6 @@ class LLMClient:
         numbered_lines = "\n".join(
             f"{ids[i]}. {s['text']}" for i, s in enumerate(sentences)
         )
-        n = len(sentences)
         description = (description or "").strip() or "（无简介）"
 
         return f"""你是一位专业的视频字幕翻译师。请将以下视频字幕翻译成中文。
@@ -620,10 +624,7 @@ class LLMClient:
 
         content = self._chat([{"role": "user", "content": prompt}])
         # 去掉可能存在的代码围栏，取第一行，再去掉包裹的引号
-        text = content.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text).strip()
+        text = strip_code_fence(content)
         text = text.splitlines()[0].strip().strip('"“”').strip()
         return text or None
 
@@ -674,7 +675,8 @@ def split_long_sentence(text: str, start_ms: int, end_ms: int, max_chars: int) -
             part_end = end_ms
         else:
             part_end = current_ms + int(available * est_dur / total_est)
-            part_end = max(part_end, current_ms + 200)  # 保底200ms，避免零时长
+            # 保底200ms 避免零时长；但不能超过 end_ms，否则最后一段会得到负时长
+            part_end = min(end_ms, max(part_end, current_ms + 200))
 
         results.append({"text": part.strip(), "start_ms": current_ms, "end_ms": part_end})
         current_ms = part_end
@@ -712,6 +714,7 @@ def postprocess_subtitles(sentences: List[Dict], translations: List[str],
 
         # 跳过纯标点/无实际内容的译文（否则 TTS 会报 NoAudioReceived）
         if not has_speakable_text(trans):
+            print(f"[后处理] 跳过无可朗读内容的译文: {trans!r}")
             continue
 
         if len(trans) > max_chars or duration > max_duration:
@@ -825,47 +828,70 @@ class TTSClient:
                         await asyncio.sleep(wait)
 
         tasks = [generate_one(i, sub["text"]) for i, sub in enumerate(subs)]
-        results = await asyncio.gather(*tasks)
+        # 任一条最终失败即取消其余任务并抛出异常，不让它们继续在后台请求 API
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        errors = [r for r in results if isinstance(r, BaseException)]
+        if errors:
+            for t in tasks:
+                t.cancel()
+            raise errors[0]
         print(f"[TTS] edge-tts 配音生成完成")
         return results
 
+    def _generate_mimo_one(self, idx: int, text: str, output_dir: Path, slot_ms: int) -> Path:
+        """生成单条 MiMo 配音（带重试机制），在线程池中同步执行"""
+        output_path = output_dir / f"tts_{idx:04d}.wav"
+
+        messages = []
+        if self.style:
+            messages.append({"role": "user", "content": self.style})
+        messages.append({"role": "assistant", "content": text})
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    audio={"format": "wav", "voice": self.voice},
+                )
+
+                # 提取 base64 音频数据
+                audio_data = response.choices[0].message.audio.data
+                audio_bytes = base64.b64decode(audio_data)
+                if not audio_bytes:
+                    raise RuntimeError("服务端未返回音频数据")
+
+                with open(output_path, "wb") as f:
+                    f.write(audio_bytes)
+
+                fit_tts_duration(output_path, slot_ms)
+                return output_path
+            except Exception as e:
+                if attempt == MAX_RETRIES:
+                    raise
+                wait = 2 ** attempt
+                print(f"[TTS] 第 {idx} 条生成失败 (第 {attempt}/{MAX_RETRIES} 次): {e}，{wait}s 后重试...")
+                time.sleep(wait)
+
     async def _generate_mimo_tts(self, subs: List[Dict], output_dir: Path) -> List[Path]:
         """使用 MiMo TTS 生成配音"""
-
         slots = compute_tts_slots(subs)
+        semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
 
-        def generate_one(idx: int, text: str) -> Path:
-            output_path = output_dir / f"tts_{idx:04d}.wav"
+        async def run_one(idx: int, text: str) -> Path:
+            # 同步 HTTP 调用放入线程池执行，信号量限制并发
+            async with semaphore:
+                return await asyncio.to_thread(
+                    self._generate_mimo_one, idx, text, output_dir, slots[idx])
 
-            messages = []
-            if self.style:
-                messages.append({"role": "user", "content": self.style})
-            messages.append({"role": "assistant", "content": text})
-
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                audio={"format": "wav", "voice": self.voice},
-            )
-
-            # 提取 base64 音频数据
-            audio_data = response.choices[0].message.audio.data
-            audio_bytes = base64.b64decode(audio_data)
-
-            with open(output_path, "wb") as f:
-                f.write(audio_bytes)
-
-            fit_tts_duration(output_path, slots[idx])
-            return output_path
-
-        # MiMo TTS 是同步 HTTP 请求，用线程池并行
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [
-                loop.run_in_executor(executor, generate_one, i, sub["text"])
-                for i, sub in enumerate(subs)
-            ]
-            results = await asyncio.gather(*futures)
+        tasks = [run_one(i, sub["text"]) for i, sub in enumerate(subs)]
+        # 任一条最终失败即取消其余任务并抛出异常，不让它们继续在后台请求 API
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        errors = [r for r in results if isinstance(r, BaseException)]
+        if errors:
+            for t in tasks:
+                t.cancel()
+            raise errors[0]
 
         print(f"[TTS] MiMo TTS 配音生成完成")
         return results
@@ -1037,11 +1063,11 @@ def compose_final_video(video_path: Path, srt_path: Optional[Path],
 
     cmd.append(str(output_path))
 
-    print(f"[FFmpeg] 正在合成最终视频...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    print("[FFmpeg] 正在合成最终视频（实时日志如下）...")
+    code, tail = _stream_subprocess(cmd, "FFmpeg")
 
-    if result.returncode != 0:
-        print(f"[FFmpeg 错误] {result.stderr}", file=sys.stderr)
+    if code != 0:
+        print(f"[FFmpeg 错误] 输出尾部:\n{tail}", file=sys.stderr)
         return False
 
     print(f"[FFmpeg] 最终视频完成: {output_path}")
@@ -1054,18 +1080,13 @@ def main():
     parser = argparse.ArgumentParser(description="YouTube 视频自动下载 + 中文字幕生成 + 中文配音")
     parser.add_argument("url", help="YouTube 视频 URL")
     parser.add_argument("-o", "--output", default="./youtube_downloads", help="根输出目录")
-    parser.add_argument("--config", default=None, help="配置文件路径 (默认: 脚本同目录下的 config.json)")
     parser.add_argument("--no-video", action="store_true", help="只下载字幕，不下载视频")
-    parser.add_argument("--no-burn", action="store_true", help="跳过烧录字幕到视频")
     parser.add_argument("--no-tts", action="store_true", help="跳过中文配音")
-    parser.add_argument("--lang", default=None, help="强制指定语言代码（如 en, ja, zh-CN）")
-    parser.add_argument("--retranslate", action="store_true", help="忽略翻译缓存，重新断句、翻译并生成字幕")
 
     args = parser.parse_args()
 
-    # 加载配置
-    config_path = Path(args.config) if args.config else None
-    config = load_config(config_path)
+    # 加载配置（固定读取脚本同目录下的 config.json）
+    config = load_config()
 
     llm_config = config["llm"]
     tts_config = config["tts"]
@@ -1086,11 +1107,9 @@ def main():
         title = metadata.get("title", "Unknown")
         description = metadata.get("description", "")
 
-        if args.lang:
-            lang = args.lang
-            print(f"[语言] 用户强制指定: {lang}")
-        else:
-            lang = detect_default_language(metadata)
+        # 按优先级列出字幕语言候选，由 yt-dlp 自动跳过不存在的轨道
+        sub_langs = detect_sub_langs(metadata)
+        print(f"[语言] 字幕语言候选: {sub_langs}")
 
         # 提前初始化，避免 --no-video 模式下引用未定义变量导致 NameError
         video_path = None
@@ -1102,28 +1121,25 @@ def main():
         print("=" * 60)
 
         if args.no_video:
-            template = str(output_dir / "%(id)s")
-            result = run_yt_dlp([
+            run_yt_dlp([
                 "--write-auto-subs", "--write-subs",
-                "--sub-langs", lang,
+                "--sub-langs", sub_langs,
                 "--sub-format", "json3",
                 "--write-thumbnail",
                 "--convert-thumbnails", "jpg",
                 "--skip-download",
-                "-o", template,
+                "-o", str(output_dir / "%(id)s"),
                 args.url,
-            ])
+            ], stream=True)
 
-            sub_path = None
-            for f in output_dir.iterdir():
-                if f.suffix == ".json3" and video_id in f.name:
-                    sub_path = f
-                    break
+            sub_path = find_downloaded_sub(output_dir, video_id, sub_langs.split(",")[0].split("-")[0])
             if sub_path is None:
-                raise FileNotFoundError("未找到下载的字幕文件")
+                raise SystemExit(
+                    f"[错误] 未找到 json3 字幕文件（语言候选: {sub_langs}）。\n"
+                    "       该视频可能不提供 json3 格式的字幕，而本脚本依赖词级时间戳，无法继续。")
             video_path = None
         else:
-            video_path, sub_path, thumbnail_path, _ = download_video_and_subs(args.url, output_dir, lang)
+            video_path, sub_path, thumbnail_path, _ = download_video_and_subs(args.url, output_dir, sub_langs, metadata)
 
         # 步骤 3: 解析 JSON3
         print("\n" + "=" * 60)
@@ -1151,40 +1167,39 @@ def main():
             "\n".join(s["text"] for s in sentences).encode("utf-8")
         ).hexdigest()
 
-        if args.retranslate and cache_path.exists():
-            cache_path.unlink()
-            print(f"[翻译] --retranslate: 已删除旧缓存 {cache_path}")
-
         def save_cache(res: Dict[int, str]):
-            """把当前进度写入缓存（未完成的句子存为 null，便于断点续传）"""
+            """把当前进度写入缓存（未完成的句子存为 null，便于断点续传）。
+
+            写入前保留旧文件中的其他字段（如 title_zh），避免增量覆盖时静默丢失。
+            """
             sparse = [res.get(i) for i in range(len(sentences))]
+            payload = {
+                "model": llm.model,
+                "source_sha": source_sha,
+                "count": len(sentences),
+                "complete": all(t is not None for t in sparse),
+                "translations": sparse,
+            }
+            old = read_json_safe(cache_path)
+            if old and isinstance(old.get("title_zh"), str):
+                payload["title_zh"] = old["title_zh"]
             with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "model": llm.model,
-                    "source_sha": source_sha,
-                    "count": len(sentences),
-                    "complete": all(t is not None for t in sparse),
-                    "translations": sparse,
-                }, f, ensure_ascii=False, indent=1)
+                json.dump(payload, f, ensure_ascii=False, indent=1)
 
         done_map: Dict[int, str] = {}
-        if cache_path.exists():
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    cache = json.load(f)
-                if (cache.get("model") == llm.model
-                        and cache.get("source_sha") == source_sha
-                        and isinstance(cache.get("translations"), list)):
-                    for i, t in enumerate(cache["translations"][:len(sentences)]):
-                        if isinstance(t, str) and t.strip():
-                            done_map[i] = t
-                    if done_map:
-                        print(f"[翻译] 从缓存恢复 {len(done_map)}/{len(sentences)} 句译文: {cache_path}")
-                    if len(done_map) == len(sentences):
-                        translations = [done_map[i] for i in range(len(sentences))]
-                        print("[翻译] 命中完整缓存，跳过 API 调用")
-            except (json.JSONDecodeError, OSError):
-                pass
+        cache = read_json_safe(cache_path)
+        if (cache
+                and cache.get("model") == llm.model
+                and cache.get("source_sha") == source_sha
+                and isinstance(cache.get("translations"), list)):
+            for i, t in enumerate(cache["translations"][:len(sentences)]):
+                if isinstance(t, str) and t.strip():
+                    done_map[i] = t
+            if done_map:
+                print(f"[翻译] 从缓存恢复 {len(done_map)}/{len(sentences)} 句译文: {cache_path}")
+            if len(done_map) == len(sentences):
+                translations = [done_map[i] for i in range(len(sentences))]
+                print("[翻译] 命中完整缓存，跳过 API 调用")
 
         if translations is None:
             translations = llm.translate(sentences, title, description,
@@ -1194,21 +1209,16 @@ def main():
 
         # 步骤 5.5: 翻译视频标题（用于最终视频文件命名，同样写入缓存）
         title_zh = None
-        if cache_path.exists():
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    t = json.load(f).get("title_zh")
-                if isinstance(t, str) and t.strip():
-                    title_zh = t.strip()
-            except (json.JSONDecodeError, OSError):
-                title_zh = None
+        cached = read_json_safe(cache_path) or {}
+        t = cached.get("title_zh")
+        if isinstance(t, str) and t.strip():
+            title_zh = t.strip()
         if title_zh is None:
             try:
                 title_zh = llm.translate_title(title, description)
                 if title_zh:
                     # 合并写入缓存文件，下次重跑不再重新翻译
-                    with open(cache_path, "r", encoding="utf-8") as f:
-                        cache_data = json.load(f)
+                    cache_data = read_json_safe(cache_path) or {}
                     cache_data["title_zh"] = title_zh
                     with open(cache_path, "w", encoding="utf-8") as f:
                         json.dump(cache_data, f, ensure_ascii=False, indent=1)
@@ -1235,33 +1245,32 @@ def main():
 
         # 步骤 7: 合成最终视频（字幕烧录 + 中文配音一步完成，只做一次视频转码）
         final_path = None
-        if video_path and not args.no_video and (not args.no_burn or not args.no_tts):
+        if video_path and not args.no_video:
             print("\n" + "=" * 60)
             print("步骤 7: 合成最终视频（字幕烧录 + 中文配音）")
             print("=" * 60)
 
-            want_burn = not args.no_burn
             want_tts = not args.no_tts
             tts = None
             tts_files = None
             mixed_audio = None
 
-            if want_tts:
-                tts = TTSClient(tts_config, llm_config)
-                if tts.enabled:
-                    # 生成所有 TTS 音频片段（自动按时间槽调速）
-                    tts_files = asyncio.run(tts.generate_all(subs, output_dir))
-                    if tts_files:
-                        mixed_audio = output_dir / f"{video_id}_zh_dub.wav"
-                        mix_tts_audio(subs, tts_files, mixed_audio)
+            try:
+                if want_tts:
+                    tts = TTSClient(tts_config, llm_config)
+                    if tts.enabled:
+                        # 生成所有 TTS 音频片段（自动按时间槽调速）
+                        tts_files = asyncio.run(tts.generate_all(subs, output_dir))
+                        if tts_files:
+                            mixed_audio = output_dir / f"{video_id}_zh_dub.wav"
+                            mix_tts_audio(subs, tts_files, mixed_audio)
 
-            if want_burn or mixed_audio:
                 final_name = sanitize_filename(title_zh or title) or video_id
                 final_path = output_dir / f"{final_name}.mp4"
                 print(f"[输出] 最终视频命名: {final_name}.mp4")
                 ok = compose_final_video(
                     video_path,
-                    srt_path if want_burn else None,
+                    srt_path,
                     mixed_audio,
                     final_path,
                     mix_with_original=bool(tts and tts.mix_with_original),
@@ -1270,13 +1279,13 @@ def main():
                     final_path = None
                 else:
                     print(f"[完成] 最终成品: {final_path}")
-
-            # 清理临时文件
-            if tts_files:
-                for f in tts_files:
-                    f.unlink(missing_ok=True)
-            if mixed_audio:
-                mixed_audio.unlink(missing_ok=True)
+            finally:
+                # 无论成功还是中途异常，都清理临时文件
+                if tts_files:
+                    for f in tts_files:
+                        f.unlink(missing_ok=True)
+                if mixed_audio:
+                    mixed_audio.unlink(missing_ok=True)
 
         # 完成
         print("\n" + "=" * 60)
