@@ -42,7 +42,9 @@ DEFAULT_CONFIG = {
         "supports_system_role": False,
         "thinking": {
             "type": "disabled"
-        }
+        },
+        "batch_size": 40,
+        "batch_max_chars": 8000
     },
     "tts": {
         "enabled": True,
@@ -51,7 +53,10 @@ DEFAULT_CONFIG = {
         "rate": "+0%",
         "volume": "+0%",
         "pitch": "+0Hz",
-        "mix_with_original": False
+        "mix_with_original": False,
+        "batch_size": 50,
+        "concurrency": 5,
+        "max_tempo": 3.0
     },
     "subtitle": {
         "max_chars_per_line": 35,
@@ -79,12 +84,7 @@ def strip_nonspeech_annotations(text: str) -> str:
     cleaned = NONSPEECH_ANNOTATION_RE.sub(" ", text or "")
     return re.sub(r"\s{2,}", " ", cleaned).strip()
 
-TRANSLATE_BATCH_SIZE = 40   # 每批发送给 LLM 翻译的句子数
-TRANSLATE_BATCH_MAX_CHARS = 8000  # 每批原字幕最大字符数
 MAX_RETRIES = 3             # 网络 API 最大重试次数
-TTS_CONCURRENCY = 5         # edge-tts 并发上限（过高会被限流/封禁）
-TTS_BATCH_SIZE = 50         # 每批生成的配音片段数
-TTS_MAX_TEMPO = 3.0         # 配音加速上限（倍速）
 SAMPLE_RATE = 48000         # 拼接音轨的采样率
 
 
@@ -477,6 +477,8 @@ class LLMClient:
         self.model = config["model"]
         self.supports_system_role = config.get("supports_system_role", True)
         self.thinking = config.get("thinking")
+        self.batch_size = max(1, int(config.get("batch_size", 40)))
+        self.batch_max_chars = max(1, int(config.get("batch_max_chars", 8000)))
 
         base_url = config["base_url"].rstrip("/")
         if not base_url.endswith("/v1"):
@@ -525,7 +527,8 @@ class LLMClient:
         """
         n_total = len(sentences)
         done = dict(done or {})
-        print(f"[翻译] 共 {n_total} 句，分批翻译（每批最多 {TRANSLATE_BATCH_SIZE} 句）...")
+        print(f"[翻译] 共 {n_total} 句，分批翻译（每批最多 {self.batch_size} 句，"
+                      f"{self.batch_max_chars} 字符）...")
 
         results: Dict[int, str] = dict(done)
         start = 0
@@ -534,12 +537,12 @@ class LLMClient:
             batch_chars = 0
             todo = []
             while (batch_end < n_total
-                   and batch_end - start < TRANSLATE_BATCH_SIZE):
+                   and batch_end - start < self.batch_size):
                 if batch_end not in results:
                     sentence_chars = len(sentences[batch_end]["text"])
                     exceeds_limit = (todo and
                                      batch_chars + sentence_chars
-                                     > TRANSLATE_BATCH_MAX_CHARS)
+                                     > self.batch_max_chars)
                     if exceeds_limit:
                         break
                     todo.append(batch_end)
@@ -811,6 +814,9 @@ class TTSClient:
         self.engine = config.get("engine", "edge-tts")
         self.enabled = config.get("enabled", True)
         self.mix_with_original = config.get("mix_with_original", False)
+        self.batch_size = max(1, int(config.get("batch_size", 50)))
+        self.concurrency = max(1, int(config.get("concurrency", 5)))
+        self.max_tempo = max(1.0, float(config.get("max_tempo", 3.0)))
         cache_config = {key: value for key, value in config.items()
                         if key not in {"api_key"}}
         self.cache_signature = hashlib.sha1(
@@ -883,8 +889,8 @@ class TTSClient:
 
         print(f"[TTS] 共 {len(pieces)} 条配音，缓存命中 {len(pieces) - len(missing)} 条，"
               f"待生成 {len(missing)} 条")
-        for batch_start in range(0, len(missing), TTS_BATCH_SIZE):
-            batch_indexes = missing[batch_start:batch_start + TTS_BATCH_SIZE]
+        for batch_start in range(0, len(missing), self.batch_size):
+            batch_indexes = missing[batch_start:batch_start + self.batch_size]
             batch_pieces = [pieces[idx] for idx in batch_indexes]
             try:
                 if self.engine == "edge-tts":
@@ -909,7 +915,7 @@ class TTSClient:
             for idx in batch_indexes:
                 entries[idx] = make_entry(idx)
             save_manifest()
-            print(f"[TTS] 进度: {min(batch_start + TTS_BATCH_SIZE, len(missing))}/"
+            print(f"[TTS] 进度: {min(batch_start + self.batch_size, len(missing))}/"
                   f"{len(missing)} 条待生成")
 
         return [path for path in files if path is not None]
@@ -919,7 +925,7 @@ class TTSClient:
         """使用 edge-tts 以自然语速生成配音"""
         import edge_tts
 
-        semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
+        semaphore = asyncio.Semaphore(self.concurrency)
 
         async def generate_one(idx: int, text: str) -> Path:
             # 注意：edge-tts 实际输出 mp3 格式（ffmpeg 会自动识别，扩展名不影响使用）
@@ -995,7 +1001,7 @@ class TTSClient:
     async def _generate_mimo_tts(self, pieces: List[Dict], output_dir: Path,
                                  indexes: Optional[List[int]] = None) -> List[Path]:
         """使用 MiMo TTS 以自然语速生成配音"""
-        semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
+        semaphore = asyncio.Semaphore(self.concurrency)
 
         async def run_one(idx: int, text: str) -> Path:
             # 同步 HTTP 调用放入线程池执行，信号量限制并发
@@ -1086,11 +1092,12 @@ def _decode_to_pcm16(path: Path):
     return np.frombuffer(result.stdout, dtype=np.int16)
 
 
-def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]]) -> List[Dict]:
+def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
+                 max_tempo: float = 3.0) -> List[Dict]:
     """为字幕片段计算最终时间轴（字幕与配音共用同一套时间）。
 
     有 TTS 音频时逐个测量真实时长并据此排布——同一句子的整组片段
-    放不下时统一加速（上限 TTS_MAX_TEMPO），字幕切换时刻与语音完全同步；
+    放不下时统一加速（上限 max_tempo），字幕切换时刻与语音完全同步；
     无音频（--no-tts / --no-video 模式）时退化为按 130ms/字 估算排布。
 
     返回 [{text, start_ms, end_ms, file, tempo}, ...]，按时间升序。
@@ -1125,11 +1132,11 @@ def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]]) -> List[Di
         tempo = 1.0
         if total > avail > 0:
             raw = total / avail
-            tempo = min(raw, TTS_MAX_TEMPO)
-            if raw > TTS_MAX_TEMPO:
+            tempo = min(raw, max_tempo)
+            if raw > max_tempo:
                 print(f"[警告] {ms_to_srt_time(span_start)} 起的字幕组严重超长："
                       f"配音需 {total}ms / 可用 {avail}ms，"
-                      f"已按最高 {TTS_MAX_TEMPO}x 加速，超出部分可能被截断")
+                      f"已按最高 {max_tempo}x 加速，超出部分可能被截断")
 
         t = span_start
         for k, piece in enumerate(group):
@@ -1468,7 +1475,8 @@ def main():
 
             # 有实测时长则按真实语音排布（字幕与配音天然同步）；
             # 否则退化为按 130ms/字 估算排布
-            clips = build_layout(pieces, tts_files)
+            max_tempo = tts.max_tempo if tts else 3.0
+            clips = build_layout(pieces, tts_files, max_tempo)
             srt_path = output_dir / f"{video_id}_zh.srt"
             generate_srt(clips, srt_path)
 
