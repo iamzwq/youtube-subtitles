@@ -39,7 +39,10 @@ DEFAULT_CONFIG = {
         "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
         "api_key": "",
         "model": "mimo-v2.5-pro",
-        "supports_system_role": False
+        "supports_system_role": False,
+        "thinking": {
+            "type": "disabled"
+        }
     },
     "tts": {
         "enabled": True,
@@ -66,6 +69,15 @@ def has_speakable_text(text: str) -> bool:
     避免手工枚举区段遗漏（如韩文）导致整片句子被误判为不可朗读而丢弃。
     """
     return any(ch.isalnum() for ch in (text or ""))
+
+# 字幕中的非语音提示：[Music]/[Applause]/(upbeat music) 等方括号/圆括号注释，及音符符号。
+# 这类内容不是台词，不应翻译或显示，去除后若整句无可朗读内容则丢弃。
+NONSPEECH_ANNOTATION_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)|[\u266a\u266b\U0001f3b5\U0001f3b6]")
+
+def strip_nonspeech_annotations(text: str) -> str:
+    """移除字幕里的非语音注释（[Music]、(applause)、♪ 等），合并多余空白。"""
+    cleaned = NONSPEECH_ANNOTATION_RE.sub(" ", text or "")
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
 
 TRANSLATE_BATCH_SIZE = 40   # 每批发送给 LLM 翻译的句子数（防止长视频超出 max_tokens 被截断）
 MAX_RETRIES = 3             # 网络 API 最大重试次数
@@ -182,10 +194,12 @@ def sanitize_filename(name: str, max_len: int = 60) -> str:
     return cleaned[:max_len].strip()
 
 
-def _stream_subprocess(cmd: List[str], label: str) -> Tuple[int, str]:
+def _stream_subprocess(cmd: List[str], label: str,
+                       log_interval_s: Optional[float] = None) -> Tuple[int, str]:
     """运行子进程并实时把合并后的 stdout/stderr 转发到控制台。
 
     按 \\r 或 \\n 切分逐行打印（兼容 ffmpeg 用 \\r 刷新的进度行）。
+    log_interval_s 设置后，控制台日志最多按指定间隔输出一次。
     返回 (returncode, 尾部输出文本)，供失败时报告错误详情。
     """
     proc = subprocess.Popen(
@@ -195,6 +209,22 @@ def _stream_subprocess(cmd: List[str], label: str) -> Tuple[int, str]:
     )
     tail: List[str] = []
     buf = ""
+    last_log_at = 0.0
+
+    def print_line(line: str, force: bool = False):
+        nonlocal last_log_at
+        line = line.strip()
+        if not line:
+            return
+        now = time.monotonic()
+        if (force or log_interval_s is None
+                or now - last_log_at >= log_interval_s):
+            print(f"[{label}] {line}")
+            last_log_at = now
+        tail.append(line)
+        if len(tail) > 60:
+            del tail[:-60]
+
     while True:
         chunk = proc.stdout.read1(4096)  # 有多少读多少，保证实时
         if not chunk:
@@ -202,15 +232,9 @@ def _stream_subprocess(cmd: List[str], label: str) -> Tuple[int, str]:
         buf += chunk.decode("utf-8", errors="replace")
         *lines, buf = re.split(r"[\r\n]", buf)
         for line in lines:
-            line = line.strip()
-            if line:
-                print(f"[{label}] {line}")
-                tail.append(line)
-                if len(tail) > 60:
-                    del tail[:-60]
+            print_line(line)
     if buf.strip():
-        print(f"[{label}] {buf.strip()}")
-        tail.append(buf.strip())
+        print_line(buf, force=True)
     code = proc.wait()
     return code, "\n".join(tail)
 
@@ -242,65 +266,48 @@ def get_video_metadata(url: str) -> Dict:
 
 
 def detect_sub_langs(metadata: Dict) -> str:
-    """构造 yt-dlp 的 --sub-langs 候选串（逗号分隔）。
-
-    按优先级列出候选：元数据语言 > 其 -orig 变体 > 去区域后缀的基础语言 > 基础语言的 -orig。
-    yt-dlp 会自动跳过不存在的轨道，因此无需预先解析出唯一精确的轨道名
-    （例如元数据标记 en-US 但只有 en 轨道时，候选串中的 en 自然命中）。
-    """
+    """选择唯一字幕轨道，优先自动字幕和视频语言的精确匹配。"""
     lang = (metadata.get("language") or "").strip()
-    cands: List[str] = []
-    if lang and lang not in ("none", "und"):
-        base = lang.split("-")[0]
-        cands += [lang, f"{lang}-orig", base, f"{base}-orig"]
-    else:
-        # 元数据没有语言信息时，从字幕轨道列表推断（-orig 即原始 ASR 轨道）
-        tracks = set(metadata.get("automatic_captions") or {}) | set(metadata.get("subtitles") or {})
-        origs = sorted(k for k in tracks if k.endswith("-orig"))
-        if origs:
-            base = origs[0].split("-")[0]
-            cands = [base, origs[0]]
-        elif tracks:
-            cands = [sorted(tracks)[0]]
+    base = lang.split("-")[0] if lang and lang not in ("none", "und") else "en"
+    automatic = metadata.get("automatic_captions") or {}
+    manual = metadata.get("subtitles") or {}
 
-    if not cands:
-        print("[语言] 无法从元数据判断，回退到 en")
-        cands = ["en"]
+    def rank(track: str, source: str) -> Tuple[int, int, str]:
+        is_auto = source == "automatic"
+        exact = track == lang or track == base
+        same_base = track.split("-")[0] == base
+        return (
+            0 if is_auto else 1,
+            0 if exact else 1 if same_base else 2,
+            track,
+        )
 
-    # 去重，保留顺序
-    seen: set = set()
-    unique = []
-    for c in cands:
-        if c not in seen:
-            seen.add(c)
-            unique.append(c)
-    return ",".join(unique)
+    tracks = [(track, "automatic") for track in automatic]
+    tracks += [(track, "manual") for track in manual if track not in automatic]
+    if not tracks:
+        print("[语言] 元数据没有字幕轨道信息，回退到 en")
+        return "en"
+
+    selected, source = min(tracks, key=lambda item: rank(item[0], item[1]))
+    print(f"[语言] 选择{source}字幕轨道: {selected}")
+    return selected
 
 
-def find_downloaded_sub(output_dir: Path, video_id: str, prefer: str) -> Optional[Path]:
-    """在输出目录查找已下载的 json3 字幕文件。
-
-    遍历顺序经排序以保证结果确定；优先选择文件名中含偏好语言码（如 en）的文件。
-    若存在多个 json3 文件，只会选用其中一个并在日志中说明，其余文件保留在磁盘上。
-    """
+def find_downloaded_sub(output_dir: Path, video_id: str,
+                        language: str) -> Optional[Path]:
+    """在输出目录查找指定语言的 json3 字幕文件。"""
     matches = []
     for f in sorted(output_dir.iterdir()):
         if f.suffix.lower() != ".json3" or not f.stem.startswith(video_id):
             continue
-        matches.append(f)
+        if f.stem == f"{video_id}.{language}":
+            matches.append(f)
     if not matches:
         return None
 
-    found = None
-    for f in matches:
-        if prefer in f.name or found is None:
-            if found is None or (prefer in f.name and prefer not in found.name):
-                found = f
-
     if len(matches) > 1:
-        others = ", ".join(m.name for m in matches if m != found)
-        print(f"[下载] 发现 {len(matches)} 个 json3 文件，选用: {found.name}（忽略: {others}）")
-    return found
+        print(f"[下载] 发现 {len(matches)} 个同语言 json3 文件，选用: {matches[0].name}")
+    return matches[0]
 
 
 def download_video_and_subs(url: str, output_dir: Path, sub_langs: str,
@@ -356,8 +363,7 @@ def download_video_and_subs(url: str, output_dir: Path, sub_langs: str,
             if thumbnail_path is None or suffix == ".jpg":
                 thumbnail_path = f
 
-    preferred = sub_langs.split(",")[0].split("-")[0]
-    sub_path = find_downloaded_sub(output_dir, video_id, preferred)
+    sub_path = find_downloaded_sub(output_dir, video_id, sub_langs)
     if video_path is None:
         raise FileNotFoundError(f"未找到下载的视频文件 (ID: {video_id})")
     if sub_path is None:
@@ -428,8 +434,8 @@ def parse_json3(json3_path: Path) -> List[Dict]:
 def split_into_sentences(words: List[Dict]) -> List[Dict]:
     """按标点分句"""
     def make_sentence(ws: List[Dict]) -> Optional[Dict]:
-        """把一组词组装成句子；纯标点/无实际内容的片段（如独立的 "..."）返回 None 丢弃"""
-        text = "".join(w["text"] for w in ws).strip()
+        """把一组词组装成句子；纯标点/非语音注释/无实际内容的片段返回 None 丢弃"""
+        text = strip_nonspeech_annotations("".join(w["text"] for w in ws).strip())
         if not has_speakable_text(text):
             return None
         return {
@@ -439,6 +445,8 @@ def split_into_sentences(words: List[Dict]) -> List[Dict]:
             "end_ms": ws[-1]["end_ms"],
         }
 
+    sentences: List[Dict] = []
+    current_words: List[Dict] = []
     for word in words:
         current_words.append(word)
         stripped = word["text"].rstrip()
@@ -466,6 +474,7 @@ class LLMClient:
         self.provider = config.get("provider", "openai")
         self.model = config["model"]
         self.supports_system_role = config.get("supports_system_role", True)
+        self.thinking = config.get("thinking")
 
         base_url = config["base_url"].rstrip("/")
         if not base_url.endswith("/v1"):
@@ -490,6 +499,8 @@ class LLMClient:
                     messages=messages,
                     temperature=temperature,
                     max_tokens=8192,
+                    **({"extra_body": {"thinking": self.thinking}}
+                       if self.thinking else {}),
                 )
                 return response.choices[0].message.content.strip()
             except Exception as e:
@@ -1108,7 +1119,7 @@ def compose_final_video(video_path: Path, srt_path: Optional[Path],
         print("[警告] 未找到 ffmpeg，跳过最终合成")
         return False
 
-    sub_style = "FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=0,MarginV=15"
+    sub_style = "FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=0,MarginV=5"
     cmd = ["ffmpeg", "-y", "-i", str(video_path)]
 
     if srt_path and audio_path:
@@ -1144,7 +1155,7 @@ def compose_final_video(video_path: Path, srt_path: Optional[Path],
     cmd.append(str(output_path))
 
     print("[FFmpeg] 正在合成最终视频（实时日志如下）...")
-    code, tail = _stream_subprocess(cmd, "FFmpeg")
+    code, tail = _stream_subprocess(cmd, "FFmpeg", log_interval_s=5.0)
 
     if code != 0:
         print(f"[FFmpeg 错误] 输出尾部:\n{tail}", file=sys.stderr)
@@ -1201,8 +1212,8 @@ def main():
         print("=" * 60)
 
         if args.no_video:
-            run_yt_dlp([
-                "--write-auto-subs", "--write-subs",
+            subtitle_args = [
+                "--write-auto-subs",
                 "--sub-langs", sub_langs,
                 "--sub-format", "json3",
                 "--write-thumbnail",
@@ -1210,9 +1221,14 @@ def main():
                 "--skip-download",
                 "-o", str(output_dir / "%(id)s"),
                 args.url,
-            ], stream=True)
+            ]
+            result = run_yt_dlp(subtitle_args, stream=True)
+            if result.returncode != 0:
+                print("[下载] 自动字幕下载失败，尝试手动字幕...")
+                subtitle_args[0] = "--write-subs"
+                result = run_yt_dlp(subtitle_args, stream=True)
 
-            sub_path = find_downloaded_sub(output_dir, video_id, sub_langs.split(",")[0].split("-")[0])
+            sub_path = find_downloaded_sub(output_dir, video_id, sub_langs)
             if sub_path is None:
                 raise SystemExit(
                     f"[错误] 未找到 json3 字幕文件（语言候选: {sub_langs}）。\n"
