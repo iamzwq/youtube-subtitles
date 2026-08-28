@@ -47,7 +47,7 @@ DEFAULT_CONFIG = {
     "tts": {
         "enabled": True,
         "engine": "edge-tts",
-        "voice": "zh-CN-XiaoxiaoNeural",
+        "voice": "zh-CN-YunyangNeural",
         "rate": "+0%",
         "volume": "+0%",
         "pitch": "+0Hz",
@@ -79,9 +79,11 @@ def strip_nonspeech_annotations(text: str) -> str:
     cleaned = NONSPEECH_ANNOTATION_RE.sub(" ", text or "")
     return re.sub(r"\s{2,}", " ", cleaned).strip()
 
-TRANSLATE_BATCH_SIZE = 40   # 每批发送给 LLM 翻译的句子数（防止长视频超出 max_tokens 被截断）
+TRANSLATE_BATCH_SIZE = 40   # 每批发送给 LLM 翻译的句子数
+TRANSLATE_BATCH_MAX_CHARS = 8000  # 每批原字幕最大字符数
 MAX_RETRIES = 3             # 网络 API 最大重试次数
 TTS_CONCURRENCY = 5         # edge-tts 并发上限（过高会被限流/封禁）
+TTS_BATCH_SIZE = 50         # 每批生成的配音片段数
 TTS_MAX_TEMPO = 3.0         # 配音加速上限（倍速）
 SAMPLE_RATE = 48000         # 拼接音轨的采样率
 
@@ -526,12 +528,27 @@ class LLMClient:
         print(f"[翻译] 共 {n_total} 句，分批翻译（每批最多 {TRANSLATE_BATCH_SIZE} 句）...")
 
         results: Dict[int, str] = dict(done)
-        for start in range(0, n_total, TRANSLATE_BATCH_SIZE):
-            batch_end = min(start + TRANSLATE_BATCH_SIZE, n_total)
-            todo = [i for i in range(start, batch_end) if i not in results]
+        start = 0
+        while start < n_total:
+            batch_end = start
+            batch_chars = 0
+            todo = []
+            while (batch_end < n_total
+                   and batch_end - start < TRANSLATE_BATCH_SIZE):
+                if batch_end not in results:
+                    sentence_chars = len(sentences[batch_end]["text"])
+                    exceeds_limit = (todo and
+                                     batch_chars + sentence_chars
+                                     > TRANSLATE_BATCH_MAX_CHARS)
+                    if exceeds_limit:
+                        break
+                    todo.append(batch_end)
+                    batch_chars += sentence_chars
+                batch_end += 1
 
             if not todo:
                 print(f"[翻译] 批次 {start}-{batch_end - 1}: 全部命中缓存，跳过")
+                start = batch_end
                 continue
 
             # 只翻译缺失的句子（保留全局真实编号，避免续传时错位）
@@ -569,6 +586,7 @@ class LLMClient:
             if on_progress:
                 on_progress(results)
             print(f"[翻译] 进度: {batch_end}/{n_total}")
+            start = batch_end
 
         print(f"[翻译] 完成，共 {len(results)} 句")
         return [results[i] for i in range(n_total)]
@@ -793,6 +811,12 @@ class TTSClient:
         self.engine = config.get("engine", "edge-tts")
         self.enabled = config.get("enabled", True)
         self.mix_with_original = config.get("mix_with_original", False)
+        cache_config = {key: value for key, value in config.items()
+                        if key not in {"api_key"}}
+        self.cache_signature = hashlib.sha1(
+            json.dumps(cache_config, sort_keys=True,
+                       ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
 
         if self.engine == "edge-tts":
             self.voice = config.get("voice", "zh-CN-XiaoxiaoNeural")
@@ -817,18 +841,81 @@ class TTSClient:
             raise ValueError(f"不支持的 TTS 引擎: {self.engine}")
 
     async def generate_all(self, pieces: List[Dict], output_dir: Path) -> List[Path]:
-        """以自然语速为所有字幕片段生成配音（不在此处调速，时间轴由 build_layout 决定）"""
+        """分批生成并缓存配音，返回与 pieces 对齐的音频路径。"""
         if not self.enabled:
             return []
 
-        print(f"[TTS] 开始生成 {len(pieces)} 条配音...")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        extension = "mp3" if self.engine == "edge-tts" else "wav"
+        manifest_path = output_dir / "tts_cache.json"
+        manifest = read_json_safe(manifest_path) or {}
+        entries = manifest.get("entries")
+        if not isinstance(entries, list):
+            entries = []
 
-        if self.engine == "edge-tts":
-            return await self._generate_edge_tts(pieces, output_dir)
-        else:
-            return await self._generate_mimo_tts(pieces, output_dir)
+        files: List[Optional[Path]] = [None] * len(pieces)
+        missing = []
 
-    async def _generate_edge_tts(self, pieces: List[Dict], output_dir: Path) -> List[Path]:
+        def make_entry(idx: int) -> Dict[str, str]:
+            return {
+                "text_sha": hashlib.sha1(
+                    pieces[idx]["text"].encode("utf-8")
+                ).hexdigest(),
+                "signature": self.cache_signature,
+            }
+
+        def save_manifest():
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump({"signature": self.cache_signature, "entries": entries},
+                          f, ensure_ascii=False, indent=1)
+
+        for idx, piece in enumerate(pieces):
+            text_sha = hashlib.sha1(piece["text"].encode("utf-8")).hexdigest()
+            entry = entries[idx] if idx < len(entries) else None
+            path = output_dir / f"tts_{idx:04d}.{extension}"
+            if (isinstance(entry, dict)
+                    and entry.get("text_sha") == text_sha
+                    and entry.get("signature") == self.cache_signature
+                    and path.exists() and path.stat().st_size > 0):
+                files[idx] = path
+            else:
+                missing.append(idx)
+
+        print(f"[TTS] 共 {len(pieces)} 条配音，缓存命中 {len(pieces) - len(missing)} 条，"
+              f"待生成 {len(missing)} 条")
+        for batch_start in range(0, len(missing), TTS_BATCH_SIZE):
+            batch_indexes = missing[batch_start:batch_start + TTS_BATCH_SIZE]
+            batch_pieces = [pieces[idx] for idx in batch_indexes]
+            try:
+                if self.engine == "edge-tts":
+                    batch_files = await self._generate_edge_tts(
+                        batch_pieces, output_dir, batch_indexes)
+                else:
+                    batch_files = await self._generate_mimo_tts(
+                        batch_pieces, output_dir, batch_indexes)
+            except Exception:
+                entries = entries[:len(pieces)]
+                entries.extend({} for _ in range(len(pieces) - len(entries)))
+                for idx in batch_indexes:
+                    path = output_dir / f"tts_{idx:04d}.{extension}"
+                    if path.exists() and path.stat().st_size > 0:
+                        entries[idx] = make_entry(idx)
+                save_manifest()
+                raise
+            for idx, path in zip(batch_indexes, batch_files):
+                files[idx] = path
+            entries = entries[:len(pieces)]
+            entries.extend({} for _ in range(len(pieces) - len(entries)))
+            for idx in batch_indexes:
+                entries[idx] = make_entry(idx)
+            save_manifest()
+            print(f"[TTS] 进度: {min(batch_start + TTS_BATCH_SIZE, len(missing))}/"
+                  f"{len(missing)} 条待生成")
+
+        return [path for path in files if path is not None]
+
+    async def _generate_edge_tts(self, pieces: List[Dict], output_dir: Path,
+                                 indexes: Optional[List[int]] = None) -> List[Path]:
         """使用 edge-tts 以自然语速生成配音"""
         import edge_tts
 
@@ -858,7 +945,9 @@ class TTSClient:
                         print(f"[TTS] 第 {idx} 条生成失败 (第 {attempt}/{MAX_RETRIES} 次): {e}，{wait}s 后重试...")
                         await asyncio.sleep(wait)
 
-        tasks = [generate_one(i, piece["text"]) for i, piece in enumerate(pieces)]
+        indexes = indexes or list(range(len(pieces)))
+        tasks = [generate_one(idx, piece["text"])
+             for idx, piece in zip(indexes, pieces)]
         # 任一条最终失败即取消其余任务并抛出异常，不让它们继续在后台请求 API
         results = await asyncio.gather(*tasks, return_exceptions=True)
         errors = [r for r in results if isinstance(r, BaseException)]
@@ -903,7 +992,8 @@ class TTSClient:
                 print(f"[TTS] 第 {idx} 条生成失败 (第 {attempt}/{MAX_RETRIES} 次): {e}，{wait}s 后重试...")
                 time.sleep(wait)
 
-    async def _generate_mimo_tts(self, pieces: List[Dict], output_dir: Path) -> List[Path]:
+    async def _generate_mimo_tts(self, pieces: List[Dict], output_dir: Path,
+                                 indexes: Optional[List[int]] = None) -> List[Path]:
         """使用 MiMo TTS 以自然语速生成配音"""
         semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
 
@@ -913,7 +1003,9 @@ class TTSClient:
                 return await asyncio.to_thread(
                     self._generate_mimo_one, idx, text, output_dir)
 
-        tasks = [run_one(i, piece["text"]) for i, piece in enumerate(pieces)]
+        indexes = indexes or list(range(len(pieces)))
+        tasks = [run_one(idx, piece["text"])
+             for idx, piece in zip(indexes, pieces)]
         # 任一条最终失败即取消其余任务并抛出异常，不让它们继续在后台请求 API
         results = await asyncio.gather(*tasks, return_exceptions=True)
         errors = [r for r in results if isinstance(r, BaseException)]
@@ -1062,23 +1154,24 @@ def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]]) -> List[Di
     if tts_files:
         for entry in layout:
             if entry["file"] and entry["tempo"] > 1.005:
-                speed_up_audio(entry["file"], entry["tempo"])
+                entry["file"] = speed_up_audio(entry["file"], entry["tempo"])
 
     return layout
 
 
-def speed_up_audio(path: Path, tempo: float):
-    """用 ffmpeg atempo 将音频加速到指定倍速（原地替换）。"""
+def speed_up_audio(path: Path, tempo: float) -> Path:
+    """用 ffmpeg atempo 生成指定倍速的临时音频。"""
     tmp_path = path.with_suffix(".fitted" + path.suffix)
     cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(path),
            "-filter:a", f"atempo={tempo:.4f}", str(tmp_path)]
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode == 0 and tmp_path.exists():
-        tmp_path.replace(path)
+        return tmp_path
     else:
         tmp_path.unlink(missing_ok=True)
         print(f"[警告] 音频加速失败，保留原始配音: {result.stderr}", file=sys.stderr)
+        return path
 
 
 def probe_duration_ms(path: Path) -> Optional[int]:
@@ -1363,6 +1456,8 @@ def main():
         tts = None
         tts_files = None
         mixed_audio = None
+        clips = []
+        cleanup_tts_cache = False
         try:
             # 配音合成仅在需要产出视频时进行；--no-video 模式只输出估算时间轴的 SRT
             if not args.no_video and not args.no_tts:
@@ -1401,12 +1496,20 @@ def main():
                     final_path = None
                 else:
                     print(f"[完成] 最终成品: {final_path}")
+                    cleanup_tts_cache = (final_path.exists()
+                                         and final_path.stat().st_size > 0)
         finally:
-            # 无论成功还是中途异常，都清理临时文件
-            if tts_files:
+            fitted_files = {
+                entry["file"] for entry in clips
+                if entry.get("file") and entry["file"] not in (tts_files or [])
+            }
+            for f in fitted_files:
+                f.unlink(missing_ok=True)
+            if cleanup_tts_cache and tts_files:
                 for f in tts_files:
                     f.unlink(missing_ok=True)
-            if mixed_audio:
+                (output_dir / "tts_cache.json").unlink(missing_ok=True)
+            if cleanup_tts_cache and mixed_audio:
                 mixed_audio.unlink(missing_ok=True)
 
         # 完成
