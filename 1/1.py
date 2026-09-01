@@ -56,7 +56,9 @@ DEFAULT_CONFIG = {
         "mix_with_original": False,
         "batch_size": 50,
         "concurrency": 5,
-        "max_tempo": 3.0
+        "max_tempo": 3.0,
+        "clone_ref_start_s": 0,
+        "clone_ref_duration_s": 20
     },
     "subtitle": {
         "max_chars_per_line": 35,
@@ -831,25 +833,59 @@ class TTSClient:
             self.pitch = config.get("pitch", "+0Hz")
             print(f"[TTS] 引擎: edge-tts, 音色: {self.voice}")
         elif self.engine == "mimo":
-            self.base_url = config.get("base_url", llm_config.get("base_url", ""))
+            own_base_url = config.get("base_url")
+            self.base_url = own_base_url or llm_config.get("base_url", "")
             self.api_key = config.get("api_key", llm_config.get("api_key", ""))
             self.model = config.get("model", "mimo-v2.5-tts")
             self.voice = config.get("voice", "茉莉")
             self.style = config.get("style", "")
 
+            # 声音克隆：voice 字段需传原视频参考音频的 base64（在主流程中注入）
+            self.is_voiceclone = self.model == "mimo-v2.5-tts-voiceclone"
+            self.clone_voice_b64 = None
+            self.clone_ref_start_s = float(config.get("clone_ref_start_s", 0))
+            self.clone_ref_duration_s = float(config.get("clone_ref_duration_s", 20))
+
             base_url = self.base_url.rstrip("/")
             if not base_url.endswith("/v1"):
                 base_url += "/v1"
+
+            # tts 未单独配 base_url 时会复用 llm 端点，voiceclone 走的可能是另一域名
+            if not own_base_url:
+                print(f"[提醒] tts 未单独配置 base_url，复用 llm 端点: {base_url}。"
+                      "若 TTS 模型不在该端点（如 voiceclone 官方用 api.xiaomimimo.com），"
+                      "请在 config 的 tts 块显式设置 base_url。")
 
             self.client = OpenAI(api_key=self.api_key, base_url=base_url, timeout=120)
             print(f"[TTS] 引擎: MiMo TTS, 模型: {self.model}, 音色: {self.voice}")
         else:
             raise ValueError(f"不支持的 TTS 引擎: {self.engine}")
 
+    def set_clone_reference(self, ref_audio_path: Path):
+        """读取参考 wav 转 base64（带 data URI 前缀）供 voiceclone 使用。
+
+        参考音频决定克隆音色，故把其内容 hash 并入缓存签名，
+        换参考音频时自动使 TTS 缓存失效。
+        """
+        audio_bytes = Path(ref_audio_path).read_bytes()
+        b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        self.clone_voice_b64 = f"data:audio/wav;base64,{b64}"
+        ref_sha = hashlib.sha1(audio_bytes).hexdigest()
+        self.cache_signature = hashlib.sha1(
+            f"{self.cache_signature}:{ref_sha}".encode("utf-8")
+        ).hexdigest()
+        print(f"[声音克隆] 参考音频已加载 ({len(audio_bytes)} 字节)")
+
     async def generate_all(self, pieces: List[Dict], output_dir: Path) -> List[Path]:
         """分批生成并缓存配音，返回与 pieces 对齐的音频路径。"""
         if not self.enabled:
             return []
+
+        if (self.engine == "mimo" and getattr(self, "is_voiceclone", False)
+                and not self.clone_voice_b64):
+            raise RuntimeError(
+                "voiceclone 模型需要原视频参考音频，但未加载。"
+                "请确认下载了视频（勿用 --no-video），或改用非克隆模型。")
 
         output_dir.mkdir(parents=True, exist_ok=True)
         extension = "mp3" if self.engine == "edge-tts" else "wav"
@@ -968,17 +1004,26 @@ class TTSClient:
         """生成单条 MiMo 配音（带重试机制），在线程池中同步执行"""
         output_path = output_dir / f"tts_{idx:04d}.wav"
 
-        messages = []
-        if self.style:
-            messages.append({"role": "user", "content": self.style})
-        messages.append({"role": "assistant", "content": text})
+        if getattr(self, "is_voiceclone", False):
+            # voiceclone：空 user 消息 + assistant 目标文本，voice 传参考音频 base64
+            messages = [
+                {"role": "user", "content": ""},
+                {"role": "assistant", "content": text},
+            ]
+            voice = self.clone_voice_b64
+        else:
+            messages = []
+            if self.style:
+                messages.append({"role": "user", "content": self.style})
+            messages.append({"role": "assistant", "content": text})
+            voice = self.voice
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    audio={"format": "wav", "voice": self.voice},
+                    audio={"format": "wav", "voice": voice},
                 )
 
                 # 提取 base64 音频数据
@@ -1090,6 +1135,25 @@ def _decode_to_pcm16(path: Path):
     if result.returncode != 0:
         raise RuntimeError(f"音频解码失败: {path}\n{result.stderr.decode(errors='ignore')}")
     return np.frombuffer(result.stdout, dtype=np.int16)
+
+
+def extract_reference_audio(video_path: Path, output_dir: Path,
+                            start_s: float = 0.0,
+                            duration_s: float = 20.0) -> Path:
+    """从原视频截取一段单声道 wav 作为声音克隆的参考音频（16kHz 控制体积）。"""
+    ref_path = output_dir / "voice_ref.wav"
+    cmd = ["ffmpeg", "-v", "error", "-y",
+           "-ss", str(max(start_s, 0.0)), "-t", str(max(duration_s, 1.0)),
+           "-i", str(video_path),
+           "-vn", "-ac", "1", "-ar", "16000", str(ref_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace")
+    if result.returncode != 0 or not ref_path.exists() or ref_path.stat().st_size == 0:
+        ref_path.unlink(missing_ok=True)  # 清理失败时可能残留的空文件
+        raise RuntimeError(f"参考音频提取失败: {video_path}\n{result.stderr}")
+    print(f"[声音克隆] 参考音频: {ref_path} "
+          f"(起始 {start_s}s, 时长 {duration_s}s)")
+    return ref_path
 
 
 def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
@@ -1517,6 +1581,7 @@ def main():
         tts = None
         tts_files = None
         mixed_audio = None
+        ref_audio = None
         clips = []
         cleanup_tts_cache = False
         try:
@@ -1524,6 +1589,16 @@ def main():
             if not args.no_video and not args.no_tts:
                 tts = TTSClient(tts_config, llm_config)
                 if tts.enabled:
+                    # 声音克隆需要原视频参考音频，先截取并注入
+                    if getattr(tts, "is_voiceclone", False):
+                        if video_path is None:
+                            raise RuntimeError(
+                                "voiceclone 模型需要原视频音频作参考，但当前无视频"
+                                "（--no-video 模式）。请下载视频或改用非克隆模型。")
+                        ref_audio = extract_reference_audio(
+                            video_path, output_dir,
+                            tts.clone_ref_start_s, tts.clone_ref_duration_s)
+                        tts.set_clone_reference(ref_audio)
                     # 自然语速合成全部配音（此时还没有最终时间轴）
                     tts_files = asyncio.run(tts.generate_all(pieces, output_dir))
 
@@ -1568,6 +1643,8 @@ def main():
             }
             for f in fitted_files:
                 f.unlink(missing_ok=True)
+            if ref_audio:
+                ref_audio.unlink(missing_ok=True)
             if cleanup_tts_cache and tts_files:
                 for f in tts_files:
                     f.unlink(missing_ok=True)
