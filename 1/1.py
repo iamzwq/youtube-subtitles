@@ -1211,13 +1211,67 @@ def _escape_filter_path(p: Path) -> str:
     return f"'{s}'"
 
 
+_NVENC_AVAILABLE: Optional[bool] = None
+
+
+def has_nvenc() -> bool:
+    """检测当前 ffmpeg 是否支持 NVIDIA h264_nvenc 硬件编码器（结果缓存）。
+
+    仅查编码器列表还不够（有些构建列出了但显卡/驱动不可用），
+    故再跑一次极短的空转编码确认真正可用。
+    """
+    global _NVENC_AVAILABLE
+    if _NVENC_AVAILABLE is not None:
+        return _NVENC_AVAILABLE
+
+    _NVENC_AVAILABLE = False
+    if not shutil.which("ffmpeg"):
+        return False
+    try:
+        listed = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        if "h264_nvenc" not in (listed.stdout or ""):
+            return False
+        # 用 1 帧测试图真正编码一次，确认驱动/显卡可用
+        probe = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "nullsrc=s=64x64",
+             "-frames:v", "1", "-c:v", "h264_nvenc", "-f", "null", "-"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        _NVENC_AVAILABLE = probe.returncode == 0
+    except Exception:
+        _NVENC_AVAILABLE = False
+    return _NVENC_AVAILABLE
+
+
+def _video_encode_args(use_nvenc: bool) -> List[str]:
+    """返回视频编码参数：优先 NVENC 硬件加速，否则回退 CPU libx264。"""
+    if use_nvenc:
+        # NVENC 用 -cq 控制质量（等价于 libx264 的 -crf），p5 约等于 fast
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "23"]
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
+
+
 def compose_final_video(video_path: Path, srt_path: Optional[Path],
                         audio_path: Optional[Path], output_path: Path,
-                        mix_with_original: bool = False) -> bool:
+                        mix_with_original: bool = False,
+                        allow_nvenc: bool = True) -> bool:
     """一步完成字幕烧录（可选）和配音替换/混合（可选），只做一次视频转码"""
     if not shutil.which("ffmpeg"):
         print("[警告] 未找到 ffmpeg，跳过最终合成")
         return False
+
+    # 需要重新编码视频（烧录字幕）时才涉及编码器选择；纯替换配音走 copy
+    use_nvenc = allow_nvenc and bool(srt_path) and has_nvenc()
+    if bool(srt_path):
+        if use_nvenc:
+            print("[FFmpeg] 检测到 NVIDIA NVENC，使用 GPU 硬件加速编码 (h264_nvenc)")
+        else:
+            print("[FFmpeg] 使用 CPU 软件编码 (libx264)"
+                  + ("" if allow_nvenc else "（已通过 --no-nvenc 禁用 GPU）"))
+    video_args = _video_encode_args(use_nvenc)
 
     sub_style = "FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=0,MarginV=5"
     cmd = ["ffmpeg", "-y", "-i", str(video_path)]
@@ -1234,14 +1288,12 @@ def compose_final_video(video_path: Path, srt_path: Optional[Path],
         else:
             fc = f"[0:v]{sub_filter}[v]"
             cmd.extend(["-filter_complex", fc, "-map", "[v]", "-map", "1:a"])
-        cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "192k"])
+        cmd.extend([*video_args, "-c:a", "aac", "-b:a", "192k"])
     elif srt_path:
         # 只烧录字幕
         sub_filter = f"subtitles={_escape_filter_path(srt_path)}:force_style='{sub_style}'"
         cmd.extend(["-vf", sub_filter,
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "192k"])
+                    *video_args, "-c:a", "aac", "-b:a", "192k"])
     elif audio_path:
         # 只替换配音（--no-burn），无需重编码视频。
         # 不加 -shortest：配音比视频短时会把视频尾部截掉，宁可尾部留白静音
@@ -1273,6 +1325,8 @@ def main():
     parser.add_argument("-o", "--output", default="./youtube_downloads", help="根输出目录")
     parser.add_argument("--no-video", action="store_true", help="只下载字幕，不下载视频")
     parser.add_argument("--no-tts", action="store_true", help="跳过中文配音")
+    parser.add_argument("--no-nvenc", action="store_true",
+                        help="禁用 NVIDIA GPU 硬件编码，强制使用 CPU (libx264)")
 
     args = parser.parse_args()
 
@@ -1499,6 +1553,7 @@ def main():
                     mixed_audio,
                     final_path,
                     mix_with_original=bool(tts and tts.mix_with_original),
+                    allow_nvenc=not args.no_nvenc,
                 )
                 if not ok:
                     final_path = None
