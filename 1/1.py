@@ -138,6 +138,7 @@ def has_preserved_literals(source: str, translation: str) -> bool:
 
 MAX_RETRIES = 3             # 网络 API 最大重试次数
 SAMPLE_RATE = 48000         # 拼接音轨的采样率
+TARGET_CHARS_PER_SEC = 5.5  # 中文配音目标语速（字/秒），用于按时长预算限制译文长度
 
 
 def load_config() -> Dict:
@@ -571,34 +572,29 @@ class LLMClient:
         """
         n_total = len(sentences)
         done = dict(done or {})
-        print(f"[翻译] 共 {n_total} 句，分批翻译（每批最多 {self.batch_size} 句，"
-                      f"{self.batch_max_chars} 字符）...")
-
         results: Dict[int, str] = dict(done)
-        start = 0
-        while start < n_total:
-            batch_end = start
-            batch_chars = 0
-            todo = []
-            while (batch_end < n_total
-                   and batch_end - start < self.batch_size):
-                if batch_end not in results:
-                    sentence_chars = len(sentences[batch_end]["text"])
-                    exceeds_limit = (todo and
-                                     batch_chars + sentence_chars
-                                     > self.batch_max_chars)
-                    if exceeds_limit:
-                        break
-                    todo.append(batch_end)
-                    batch_chars += sentence_chars
-                batch_end += 1
 
-            if not todo:
-                print(f"[翻译] 批次 {start}-{batch_end - 1}: 全部命中缓存，跳过")
-                start = batch_end
-                continue
+        # 先过滤出待翻译的句子编号，再按句数/字符数上限纯粋分批，
+        # 避免把缓存跳过逻辑与分批逻辑纠缠在一起。
+        pending = [i for i in range(n_total) if i not in results]
+        print(f"[翻译] 共 {n_total} 句，待翻译 {len(pending)} 句（每批最多 "
+              f"{self.batch_size} 句，{self.batch_max_chars} 字符）...")
 
-            # 只翻译缺失的句子（保留全局真实编号，避免续传时错位）
+        cursor = 0
+        while cursor < len(pending):
+            # 截取一个批次：受句数上限与字符数上限双重约束（至少 1 句）
+            todo = [pending[cursor]]
+            batch_chars = len(sentences[pending[cursor]]["text"])
+            cursor += 1
+            while cursor < len(pending) and len(todo) < self.batch_size:
+                next_chars = len(sentences[pending[cursor]]["text"])
+                if batch_chars + next_chars > self.batch_max_chars:
+                    break
+                todo.append(pending[cursor])
+                batch_chars += next_chars
+                cursor += 1
+
+            # 保留全局真实编号，避免续传时错位
             sub_sentences = [sentences[i] for i in todo]
             prompt = self._build_prompt(sub_sentences, title, description, todo, glossary)
 
@@ -645,8 +641,7 @@ class LLMClient:
             results.update(batch_result)
             if on_progress:
                 on_progress(results)
-            print(f"[翻译] 进度: {batch_end}/{n_total}")
-            start = batch_end
+            print(f"[翻译] 进度: {len(results)}/{n_total}")
 
         print(f"[翻译] 完成，共 {len(results)} 句")
         return [results[i] for i in range(n_total)]
@@ -687,7 +682,15 @@ class LLMClient:
         for sentence_id, sentence in zip(ids, sentences):
             protected, replacements = protect_translation_literals(
                 sentence["text"], sentence_id)
-            numbered_lines.append(f"{sentence_id}. {protected}")
+            # 按原句时长×目标语速算出字数预算；仅当自然译文预计会超预算
+            # （信息密集句）时才附字数提示，避免无谓约束时间充裕的句子
+            duration_ms = max(sentence["end_ms"] - sentence["start_ms"], 0)
+            budget = max(round(duration_ms / 1000 * TARGET_CHARS_PER_SEC), 6)
+            est_zh_chars = len(sentence["text"].split()) * 1.8
+            if est_zh_chars > budget:
+                numbered_lines.append(f"{sentence_id}. [≤{budget}字] {protected}")
+            else:
+                numbered_lines.append(f"{sentence_id}. {protected}")
             literal_lines.extend(
                 f"- {placeholder} = {literal}"
                 for placeholder, literal in replacements.items()
@@ -716,6 +719,8 @@ class LLMClient:
 {glossary_block}
 {literal_block}
 以下是视频的一段字幕文本，每句前面有编号。请严格逐句翻译，不要合并或拆分句子，不要遗漏任何一句。译文应自然流畅，符合中文表达习惯，适合作为视频字幕。
+
+部分句子编号后带有 [≤N字] 参考字数（由配音时间预算算出，只出现在信息较密的句子上）：请尽量精简、靠近该字数，以免配音语速过快。但忠实与自然优先：若精简会损失关键信息或使中文生硬，可适当超出——绝不可为压字数而遗漏、简化或臆造信息。未标字数的句子按正常翻译即可。
 
 原文中未替换为占位符的快捷键、代码、命令或界面文字等英文/数字字面量，也必须逐字符原样保留，不得翻译、纠错、改变大小写或改变字符数量。
 
@@ -908,10 +913,15 @@ class TTSClient:
         self.pitch = config.get("pitch", "+0Hz")
         print(f"[TTS] 引擎: edge-tts, 音色: {self.voice}")
 
-    async def generate_all(self, pieces: List[Dict], output_dir: Path) -> List[Path]:
-        """分批生成并缓存配音，返回与 pieces 对齐的音频路径。"""
+    async def generate_all(self, pieces: List[Dict], output_dir: Path
+                           ) -> Tuple[List[Path], List[Optional[int]]]:
+        """分批生成并缓存配音，返回与 pieces 对齐的 (音频路径, 时长毫秒)。
+
+        时长在生成时用 ffprobe 测一次并写入 tts_cache.json，
+        避免后续 build_layout 再对每条配音重复 fork ffprobe。
+        """
         if not self.enabled:
-            return []
+            return [], []
 
         output_dir.mkdir(parents=True, exist_ok=True)
         extension = "mp3"
@@ -922,14 +932,17 @@ class TTSClient:
             entries = []
 
         files: List[Optional[Path]] = [None] * len(pieces)
+        durations: List[Optional[int]] = [None] * len(pieces)
         missing = []
 
-        def make_entry(idx: int) -> Dict[str, str]:
+        def make_entry(idx: int) -> Dict[str, object]:
+            path = output_dir / f"tts_{idx:04d}.{extension}"
             return {
                 "text_sha": hashlib.sha1(
                     pieces[idx]["text"].encode("utf-8")
                 ).hexdigest(),
                 "signature": self.cache_signature,
+                "duration_ms": probe_duration_ms(path),
             }
 
         def save_manifest():
@@ -946,6 +959,10 @@ class TTSClient:
                     and entry.get("signature") == self.cache_signature
                     and path.exists() and path.stat().st_size > 0):
                 files[idx] = path
+                cached_dur = entry.get("duration_ms")
+                # 旧缓存无时长字段时补测一次
+                durations[idx] = (cached_dur if isinstance(cached_dur, int)
+                                  else probe_duration_ms(path))
             else:
                 missing.append(idx)
 
@@ -972,11 +989,18 @@ class TTSClient:
             entries.extend({} for _ in range(len(pieces) - len(entries)))
             for idx in batch_indexes:
                 entries[idx] = make_entry(idx)
+                durations[idx] = entries[idx]["duration_ms"]
             save_manifest()
             print(f"[TTS] 进度: {min(batch_start + self.batch_size, len(missing))}/"
                   f"{len(missing)} 条待生成")
 
-        return [path for path in files if path is not None]
+        result_files: List[Path] = []
+        result_durations: List[Optional[int]] = []
+        for path, dur in zip(files, durations):
+            if path is not None:
+                result_files.append(path)
+                result_durations.append(dur)
+        return result_files, result_durations
 
     async def _generate_edge_tts(self, pieces: List[Dict], output_dir: Path,
                                  indexes: Optional[List[int]] = None) -> List[Path]:
@@ -1092,10 +1116,13 @@ def _decode_to_pcm16(path: Path):
 
 
 def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
-                 max_tempo: float = 3.0) -> List[Dict]:
+                 max_tempo: float = 3.0,
+                 known_durations: Optional[List[Optional[int]]] = None
+                 ) -> List[Dict]:
     """为字幕片段计算最终时间轴（字幕与配音共用同一套时间）。
 
-    有 TTS 音频时逐个测量真实时长并据此排布——同一句子的整组片段
+    有真实配音时按实测时长排布（优先用 known_durations 中生成阶段已缓存
+    的时长，否则回退到当场 probe）——同一句子的整组片段
     放不下时统一加速（上限 max_tempo），字幕切换时刻与语音完全同步；
     无音频（--no-tts / --no-video 模式）时退化为按 130ms/字 估算排布。
 
@@ -1106,7 +1133,9 @@ def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
     durations = []
     for idx, piece in enumerate(pieces):
         dur = None
-        if tts_files:
+        if known_durations is not None and idx < len(known_durations):
+            dur = known_durations[idx]
+        elif tts_files:
             dur = probe_duration_ms(tts_files[idx])
         if dur is None:
             dur = len(piece["text"]) * EST_MS_PER_CHAR
@@ -1126,8 +1155,15 @@ def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
         span_start = group[0]["span_start"]
         span_end = group[0]["span_end"]
 
+        # 借用到下一句开始前的静音间隙，给配音更多空间以减少加速
+        # （末句无后继，保持自身跨度）
+        if j < len(pieces):
+            effective_end = max(span_end, pieces[j]["span_start"])
+        else:
+            effective_end = span_end
+
         total = sum(group_dur)
-        avail = max(span_end - span_start, 0)
+        avail = max(effective_end - span_start, 0)
         tempo = 1.0
         if total > avail > 0:
             raw = total / avail
@@ -1316,6 +1352,117 @@ def compose_final_video(video_path: Path, srt_path: Optional[Path],
     return True
 
 
+# ==================== 翻译阶段 ====================
+
+def translate_sentences(llm_config: Dict, sentences: List[Dict],
+                        title: str, description: str,
+                        output_dir: Path, video_id: str
+                        ) -> Tuple[List[str], Optional[str]]:
+    """翻译阶段：提取术语表 → 逐句翻译 → 翻译标题。
+
+    所有中间结果写入 {video_id}_translations.json，中断后重跑自动断点续传。
+    返回 (译文列表, 中文标题或 None)。
+    """
+    llm = LLMClient(llm_config)
+    cache_path = output_dir / f"{video_id}_translations.json"
+    source_sha = hashlib.sha1(
+        "\n".join(s["text"] for s in sentences).encode("utf-8")
+    ).hexdigest()
+
+    # 提取全片统一术语表（一次调用；结果写入缓存供断点续传复用）
+    cached_data = read_json_safe(cache_path) or {}
+    g = cached_data.get("glossary")
+    if (isinstance(g, list) and g
+            and all(isinstance(x, dict) and x.get("term") and x.get("zh") for x in g)):
+        glossary = g
+        print(f"[术语表] 从缓存恢复 {len(glossary)} 条词条")
+    else:
+        try:
+            glossary = llm.extract_glossary(sentences)
+            print(f"[术语表] 提取到 {len(glossary)} 条词条")
+            cached_data["glossary"] = glossary
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(cached_data, f, ensure_ascii=False, indent=1)
+        except Exception as e:
+            print(f"[警告] 术语表提取失败，将以无术语表模式继续: {e}", file=sys.stderr)
+            glossary = []
+
+    def save_cache(res: Dict[int, str]):
+        """把当前进度写入缓存（未完成的句子存为 null，便于断点续传）。
+
+        写入时保留旧文件中所有非本函数管理的字段（title_zh、glossary 等）。
+        """
+        sparse = [res.get(i) for i in range(len(sentences))]
+        payload = {
+            "model": llm.model,
+            "source_sha": source_sha,
+            "count": len(sentences),
+            "complete": all(t is not None for t in sparse),
+            "translations": sparse,
+        }
+        old = read_json_safe(cache_path) or {}
+        for key, value in old.items():
+            payload.setdefault(key, value)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=1)
+
+    done_map: Dict[int, str] = {}
+    cache = read_json_safe(cache_path)
+    if (cache
+            and cache.get("model") == llm.model
+            and cache.get("source_sha") == source_sha
+            and isinstance(cache.get("translations"), list)):
+        for i, t in enumerate(cache["translations"][:len(sentences)]):
+            if (isinstance(t, str) and t.strip()
+                    and has_preserved_literals(sentences[i]["text"], t)):
+                done_map[i] = t
+            elif isinstance(t, str) and t.strip():
+                print(f"[翻译] 缓存中的第 {i} 句改写了快捷键或代码字面量，"
+                      "将重新翻译")
+        if done_map:
+            print(f"[翻译] 从缓存恢复 {len(done_map)}/{len(sentences)} 句译文: {cache_path}")
+
+    if len(done_map) == len(sentences):
+        translations = [done_map[i] for i in range(len(sentences))]
+        print("[翻译] 命中完整缓存，跳过 API 调用")
+    else:
+        translations = llm.translate(sentences, title, description,
+                                     done=done_map, on_progress=save_cache,
+                                     glossary=glossary)
+        save_cache({i: t for i, t in enumerate(translations)})
+        print(f"[翻译] 结果已缓存: {cache_path}")
+
+    title_zh = translate_title_cached(llm, title, description, cache_path)
+
+    for i, t in enumerate(translations[:3]):
+        print(f"  译{i+1}: {t[:60]}...")
+
+    return translations, title_zh
+
+
+def translate_title_cached(llm: "LLMClient", title: str, description: str,
+                           cache_path: Path) -> Optional[str]:
+    """翻译视频标题（用于最终视频文件命名），结果写入缓存，失败返回 None。"""
+    cached = read_json_safe(cache_path) or {}
+    t = cached.get("title_zh")
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+
+    try:
+        title_zh = llm.translate_title(title, description)
+    except Exception as e:
+        print(f"[警告] 标题翻译失败，将使用原标题命名: {e}", file=sys.stderr)
+        return None
+
+    if title_zh:
+        cache_data = read_json_safe(cache_path) or {}
+        cache_data["title_zh"] = title_zh
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=1)
+        print(f"[标题] 中文标题: {title_zh}")
+    return title_zh
+
+
 # ==================== 主流程 ====================
 
 def main():
@@ -1405,104 +1552,12 @@ def main():
         for i, s in enumerate(sentences[:3]):
             print(f"  句{i+1}: [{ms_to_srt_time(s['start_ms'])}] {s['text'][:60]}...")
 
-        # 步骤 5: LLM 翻译（逐批写缓存，中断后重跑自动断点续传）
+        # 步骤 5: LLM 翻译（术语表 + 逐句翻译 + 标题翻译，带断点续传缓存）
         print("\n" + "=" * 60)
         print("步骤 5: LLM 翻译")
         print("=" * 60)
-        llm = LLMClient(llm_config)
-        translations = None
-        cache_path = output_dir / f"{video_id}_translations.json"
-        source_sha = hashlib.sha1(
-            "\n".join(s["text"] for s in sentences).encode("utf-8")
-        ).hexdigest()
-
-        # 步骤 5.0: 提取全片统一术语表（一次调用；结果写入缓存供断点续传复用）
-        cached_data = read_json_safe(cache_path) or {}
-        g = cached_data.get("glossary")
-        glossary = None
-        if (isinstance(g, list) and g
-                and all(isinstance(x, dict) and x.get("term") and x.get("zh") for x in g)):
-            glossary = g
-            print(f"[术语表] 从缓存恢复 {len(glossary)} 条词条")
-        else:
-            try:
-                glossary = llm.extract_glossary(sentences)
-                print(f"[术语表] 提取到 {len(glossary)} 条词条")
-                cached_data["glossary"] = glossary
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    json.dump(cached_data, f, ensure_ascii=False, indent=1)
-            except Exception as e:
-                print(f"[警告] 术语表提取失败，将以无术语表模式继续: {e}", file=sys.stderr)
-                glossary = []
-
-        def save_cache(res: Dict[int, str]):
-            """把当前进度写入缓存（未完成的句子存为 null，便于断点续传）。
-
-            写入时保留旧文件中所有非本函数管理的字段（title_zh、glossary 等）。
-            """
-            sparse = [res.get(i) for i in range(len(sentences))]
-            payload = {
-                "model": llm.model,
-                "source_sha": source_sha,
-                "count": len(sentences),
-                "complete": all(t is not None for t in sparse),
-                "translations": sparse,
-            }
-            old = read_json_safe(cache_path) or {}
-            # 保留旧文件中所有非本函数管理的字段（如 title_zh、glossary），避免覆盖丢失
-            for key, value in old.items():
-                payload.setdefault(key, value)
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=1)
-
-        done_map: Dict[int, str] = {}
-        cache = read_json_safe(cache_path)
-        if (cache
-                and cache.get("model") == llm.model
-                and cache.get("source_sha") == source_sha
-                and isinstance(cache.get("translations"), list)):
-            for i, t in enumerate(cache["translations"][:len(sentences)]):
-                if (isinstance(t, str) and t.strip()
-                        and has_preserved_literals(sentences[i]["text"], t)):
-                    done_map[i] = t
-                elif isinstance(t, str) and t.strip():
-                    print(f"[翻译] 缓存中的第 {i} 句改写了快捷键或代码字面量，"
-                          "将重新翻译")
-            if done_map:
-                print(f"[翻译] 从缓存恢复 {len(done_map)}/{len(sentences)} 句译文: {cache_path}")
-            if len(done_map) == len(sentences):
-                translations = [done_map[i] for i in range(len(sentences))]
-                print("[翻译] 命中完整缓存，跳过 API 调用")
-
-        if translations is None:
-            translations = llm.translate(sentences, title, description,
-                                         done=done_map, on_progress=save_cache,
-                                         glossary=glossary)
-            save_cache({i: t for i, t in enumerate(translations)})
-            print(f"[翻译] 结果已缓存: {cache_path}")
-
-        # 步骤 5.5: 翻译视频标题（用于最终视频文件命名，同样写入缓存）
-        title_zh = None
-        cached = read_json_safe(cache_path) or {}
-        t = cached.get("title_zh")
-        if isinstance(t, str) and t.strip():
-            title_zh = t.strip()
-        if title_zh is None:
-            try:
-                title_zh = llm.translate_title(title, description)
-                if title_zh:
-                    # 合并写入缓存文件，下次重跑不再重新翻译
-                    cache_data = read_json_safe(cache_path) or {}
-                    cache_data["title_zh"] = title_zh
-                    with open(cache_path, "w", encoding="utf-8") as f:
-                        json.dump(cache_data, f, ensure_ascii=False, indent=1)
-                    print(f"[标题] 中文标题: {title_zh}")
-            except Exception as e:
-                print(f"[警告] 标题翻译失败，将使用原标题命名: {e}", file=sys.stderr)
-                title_zh = None
-
-        for i, t in enumerate(translations[:3]):
-            print(f"  译{i+1}: {t[:60]}...")
+        translations, title_zh = translate_sentences(
+            llm_config, sentences, title, description, output_dir, video_id)
 
         # 步骤 6: 切分中文字幕文本（纯文本规则；真实时间轴由配音实测时长决定）
         print("\n" + "=" * 60)
@@ -1519,6 +1574,7 @@ def main():
         print("=" * 60)
         tts = None
         tts_files = None
+        tts_durations = None
         mixed_audio = None
         clips = []
         cleanup_tts_cache = False
@@ -1528,12 +1584,14 @@ def main():
                 tts = TTSClient(tts_config)
                 if tts.enabled:
                     # 自然语速合成全部配音（此时还没有最终时间轴）
-                    tts_files = asyncio.run(tts.generate_all(pieces, output_dir))
+                    tts_files, tts_durations = asyncio.run(
+                        tts.generate_all(pieces, output_dir))
 
             # 有实测时长则按真实语音排布（字幕与配音天然同步）；
             # 否则退化为按 130ms/字 估算排布
             max_tempo = tts.max_tempo if tts else 3.0
-            clips = build_layout(pieces, tts_files, max_tempo)
+            clips = build_layout(pieces, tts_files, max_tempo,
+                                 known_durations=tts_durations)
             srt_path = output_dir / f"{video_id}_zh.srt"
             generate_srt(clips, srt_path)
 
