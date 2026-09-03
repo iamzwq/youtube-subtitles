@@ -9,14 +9,13 @@ YouTube 视频自动下载 + 词级字幕翻译 + 纯中文 SRT 字幕生成 + �
 3. 解析字幕 → 按标点分句 → 记录每句首尾词时间
 4. 调用 LLM 整篇翻译（带标题/简介上下文 + 统一术语表）
 5. 时间对齐 → 生成纯中文 SRT 字幕
-6. 中文配音：支持 edge-tts 或 MiMo TTS；按实测语音时长自动排布字幕与配音的时间轴
+6. 中文配音：使用 edge-tts；按实测语音时长自动排布字幕与配音的时间轴
 7. 字幕烧录 + 配音一步合成最终视频（--no-tts 可跳过配音）
 8. 翻译结果本地缓存（逐批保存），中断后重跑自动断点续传
 """
 
 import argparse
 import asyncio
-import base64
 import hashlib
 import json
 import re
@@ -25,6 +24,7 @@ import subprocess
 import sys
 import time
 import wave
+from collections import Counter
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
@@ -35,7 +35,6 @@ from openai import OpenAI
 
 DEFAULT_CONFIG = {
     "llm": {
-        "provider": "mimo",
         "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
         "api_key": "",
         "model": "mimo-v2.5-pro",
@@ -77,10 +76,65 @@ def has_speakable_text(text: str) -> bool:
 # 这类内容不是台词，不应翻译或显示，去除后若整句无可朗读内容则丢弃。
 NONSPEECH_ANNOTATION_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)|[\u266a\u266b\U0001f3b5\U0001f3b6]")
 
+PROTECTED_LITERAL_RE = re.compile(
+    r"""(?<![\w])(?:
+        (?:Ctrl|Alt|Shift|Cmd|Command|Option|Meta)(?:\+[A-Za-z0-9]+)+
+        |F(?:[1-9]|1[0-2])
+        |--?[A-Za-z][A-Za-z0-9-]*
+        |:[A-Za-z][A-Za-z0-9!]*
+        |[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+
+        |(?P<repeated_letter>[A-Za-z])(?P=repeated_letter)+
+    )(?![\w])""",
+    re.VERBOSE,
+)
+
 def strip_nonspeech_annotations(text: str) -> str:
     """移除字幕里的非语音注释（[Music]、(applause)、♪ 等），合并多余空白。"""
     cleaned = NONSPEECH_ANNOTATION_RE.sub(" ", text or "")
     return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+def protect_translation_literals(text: str,
+                                 sentence_id: int) -> Tuple[str, Dict[str, str]]:
+    """把快捷键、命令和代码字面量替换为可校验的不可翻译占位符。"""
+    replacements: Dict[str, str] = {}
+
+    def replace_literal(match: re.Match) -> str:
+        placeholder = f"[[KEEP_{sentence_id}_{len(replacements)}]]"
+        replacements[placeholder] = match.group(0)
+        return placeholder
+
+    return PROTECTED_LITERAL_RE.sub(replace_literal, text), replacements
+
+
+def restore_translation_literals(source: str, translation: str,
+                                 sentence_id: int) -> Optional[str]:
+    """验证占位符并恢复字面量；丢失、重复或改写时返回 None。"""
+    _, replacements = protect_translation_literals(source, sentence_id)
+    restored = translation
+    for placeholder, literal in replacements.items():
+        if restored.count(placeholder) != 1:
+            return None
+        restored = restored.replace(placeholder, literal)
+
+    expected = Counter(replacements.values())
+    actual = Counter(
+        match.group(0) for match in PROTECTED_LITERAL_RE.finditer(restored)
+    )
+    if any(actual[literal] != count for literal, count in expected.items()):
+        return None
+    return restored
+
+
+def has_preserved_literals(source: str, translation: str) -> bool:
+    """检查译文是否完整保留源句中的快捷键、命令和代码字面量。"""
+    expected = Counter(
+        match.group(0) for match in PROTECTED_LITERAL_RE.finditer(source)
+    )
+    actual = Counter(
+        match.group(0) for match in PROTECTED_LITERAL_RE.finditer(translation)
+    )
+    return all(actual[literal] == count for literal, count in expected.items())
 
 MAX_RETRIES = 3             # 网络 API 最大重试次数
 SAMPLE_RATE = 48000         # 拼接音轨的采样率
@@ -114,13 +168,6 @@ def load_config() -> Dict:
     if not llm.get("model"):
         print("[错误] 配置文件中缺少 llm.model", file=sys.stderr)
         sys.exit(1)
-
-    # 验证 TTS 配置（如果启用）
-    tts = config.get("tts", {})
-    if tts.get("enabled", True) and tts.get("engine") == "mimo":
-        if not tts.get("api_key") and not llm.get("api_key"):
-            print("[错误] TTS 使用 mimo 引擎时需要 api_key", file=sys.stderr)
-            sys.exit(1)
 
     return config
 
@@ -471,7 +518,6 @@ class LLMClient:
     """统一 LLM 客户端"""
 
     def __init__(self, config: Dict):
-        self.provider = config.get("provider", "openai")
         self.model = config["model"]
         self.supports_system_role = config.get("supports_system_role", True)
         self.thinking = config.get("thinking")
@@ -488,7 +534,7 @@ class LLMClient:
             timeout=120,
         )
 
-        print(f"[LLM] 初始化: {self.provider} @ {base_url}")
+        print(f"[LLM] 初始化: {base_url}")
         print(f"[LLM] 模型: {self.model}")
 
     def _chat(self, messages: List[Dict], temperature: float = 0.3) -> str:
@@ -568,7 +614,20 @@ class LLMClient:
             batch_result: Dict[int, str] = {}
             for attempt in range(1, MAX_RETRIES + 1):
                 content = self._chat(messages)
-                batch_result = self._parse_json_translations(content, todo[0], todo[-1] + 1)
+                parsed = self._parse_json_translations(
+                    content, todo[0], todo[-1] + 1)
+                batch_result = {}
+                for sentence_id, sentence in zip(todo, sub_sentences):
+                    translated = parsed.get(sentence_id)
+                    if translated is None:
+                        continue
+                    restored = restore_translation_literals(
+                        sentence["text"], translated, sentence_id)
+                    if restored is not None:
+                        batch_result[sentence_id] = restored
+                    else:
+                        print(f"[警告] 第 {sentence_id} 句的快捷键或代码字面量"
+                              "被改写，将重新翻译")
                 missing = [i for i in todo if i not in batch_result]
                 if not missing:
                     break
@@ -623,9 +682,25 @@ class LLMClient:
     @staticmethod
     def _build_prompt(sentences: List[Dict], title: str, description: str, ids: List[int],
                       glossary: Optional[List[Dict]] = None) -> str:
-        numbered_lines = "\n".join(
-            f"{ids[i]}. {s['text']}" for i, s in enumerate(sentences)
-        )
+        numbered_lines = []
+        literal_lines = []
+        for sentence_id, sentence in zip(ids, sentences):
+            protected, replacements = protect_translation_literals(
+                sentence["text"], sentence_id)
+            numbered_lines.append(f"{sentence_id}. {protected}")
+            literal_lines.extend(
+                f"- {placeholder} = {literal}"
+                for placeholder, literal in replacements.items()
+            )
+        numbered_text = "\n".join(numbered_lines)
+        literal_block = ""
+        if literal_lines:
+            literal_block = (
+                "\n不可翻译占位符（译文中必须逐字保留每个占位符且恰好出现一次；"
+                "不要直接输出等号右侧的原文，程序会自动恢复）：\n"
+                + "\n".join(literal_lines)
+                + "\n"
+            )
         description = (description or "").strip() or "（无简介）"
 
         glossary_block = ""
@@ -639,14 +714,15 @@ class LLMClient:
 视频标题：{title}
 视频简介：{description}
 {glossary_block}
+{literal_block}
 以下是视频的一段字幕文本，每句前面有编号。请严格逐句翻译，不要合并或拆分句子，不要遗漏任何一句。译文应自然流畅，符合中文表达习惯，适合作为视频字幕。
 
-原文中出现的快捷键、代码、命令或界面文字等英文/数字字面量（如 zz、Ctrl+Z、F5、save_file），必须在译文中逐字符原样保留，不得翻译、纠错、改变大小写或改变字符数量。
+原文中未替换为占位符的快捷键、代码、命令或界面文字等英文/数字字面量，也必须逐字符原样保留，不得翻译、纠错、改变大小写或改变字符数量。
 
 输出要求：只输出一个 JSON 数组，每个元素格式为 {{"id": 编号, "zh": "该句中文译文"}}。编号可能与其它批次重叠或看起来不连续，但必须与原句前面的编号完全一致，一个都不能改、不能漏。不要输出 markdown 代码块标记，不要输出任何解释。
 
 原文：
-{numbered_lines}
+{numbered_text}
 
 中文译文（JSON 数组）："""
 
@@ -810,7 +886,7 @@ def generate_srt(subs: List[Dict], output_path: Path):
 class TTSClient:
     """统一 TTS 客户端"""
 
-    def __init__(self, config: Dict, llm_config: Dict):
+    def __init__(self, config: Dict):
         self.engine = config.get("engine", "edge-tts")
         self.enabled = config.get("enabled", True)
         self.mix_with_original = config.get("mix_with_original", False)
@@ -824,32 +900,13 @@ class TTSClient:
                        ensure_ascii=False).encode("utf-8")
         ).hexdigest()
 
-        if self.engine == "edge-tts":
-            self.voice = config.get("voice", "zh-CN-YunyangNeural")
-            self.rate = config.get("rate", "+0%")
-            self.volume = config.get("volume", "+0%")
-            self.pitch = config.get("pitch", "+0Hz")
-            print(f"[TTS] 引擎: edge-tts, 音色: {self.voice}")
-        elif self.engine == "mimo":
-            own_base_url = config.get("base_url")
-            self.base_url = own_base_url or llm_config.get("base_url", "")
-            self.api_key = config.get("api_key", llm_config.get("api_key", ""))
-            self.model = config.get("model", "mimo-v2.5-tts")
-            self.voice = config.get("voice", "白桦")
-
-            base_url = self.base_url.rstrip("/")
-            if not base_url.endswith("/v1"):
-                base_url += "/v1"
-
-            if not own_base_url:
-                print(f"[提醒] tts 未单独配置 base_url，复用 llm 端点: {base_url}。"
-                      "若 TTS 模型不在该端点，"
-                      "请在 config 的 tts 块显式设置 base_url。")
-
-            self.client = OpenAI(api_key=self.api_key, base_url=base_url, timeout=120)
-            print(f"[TTS] 引擎: MiMo TTS, 模型: {self.model}, 音色: {self.voice}")
-        else:
+        if self.engine != "edge-tts":
             raise ValueError(f"不支持的 TTS 引擎: {self.engine}")
+        self.voice = config.get("voice", "zh-CN-YunyangNeural")
+        self.rate = config.get("rate", "+0%")
+        self.volume = config.get("volume", "+0%")
+        self.pitch = config.get("pitch", "+0Hz")
+        print(f"[TTS] 引擎: edge-tts, 音色: {self.voice}")
 
     async def generate_all(self, pieces: List[Dict], output_dir: Path) -> List[Path]:
         """分批生成并缓存配音，返回与 pieces 对齐的音频路径。"""
@@ -857,7 +914,7 @@ class TTSClient:
             return []
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        extension = "mp3" if self.engine == "edge-tts" else "wav"
+        extension = "mp3"
         manifest_path = output_dir / "tts_cache.json"
         manifest = read_json_safe(manifest_path) or {}
         entries = manifest.get("entries")
@@ -898,12 +955,8 @@ class TTSClient:
             batch_indexes = missing[batch_start:batch_start + self.batch_size]
             batch_pieces = [pieces[idx] for idx in batch_indexes]
             try:
-                if self.engine == "edge-tts":
-                    batch_files = await self._generate_edge_tts(
-                        batch_pieces, output_dir, batch_indexes)
-                else:
-                    batch_files = await self._generate_mimo_tts(
-                        batch_pieces, output_dir, batch_indexes)
+                batch_files = await self._generate_edge_tts(
+                    batch_pieces, output_dir, batch_indexes)
             except Exception:
                 entries = entries[:len(pieces)]
                 entries.extend({} for _ in range(len(pieces) - len(entries)))
@@ -967,62 +1020,6 @@ class TTSClient:
                 t.cancel()
             raise errors[0]
         print(f"[TTS] edge-tts 配音生成完成")
-        return results
-
-    def _generate_mimo_one(self, idx: int, text: str, output_dir: Path) -> Path:
-        """生成单条 MiMo 配音（带重试机制），在线程池中同步执行"""
-        output_path = output_dir / f"tts_{idx:04d}.wav"
-
-        messages = [{"role": "assistant", "content": text}]
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    audio={"format": "wav", "voice": self.voice},
-                )
-
-                # 提取 base64 音频数据
-                audio_data = response.choices[0].message.audio.data
-                audio_bytes = base64.b64decode(audio_data)
-                if not audio_bytes:
-                    raise RuntimeError("服务端未返回音频数据")
-
-                with open(output_path, "wb") as f:
-                    f.write(audio_bytes)
-
-                return output_path
-            except Exception as e:
-                if attempt == MAX_RETRIES:
-                    raise
-                wait = 2 ** attempt
-                print(f"[TTS] 第 {idx} 条生成失败 (第 {attempt}/{MAX_RETRIES} 次): {e}，{wait}s 后重试...")
-                time.sleep(wait)
-
-    async def _generate_mimo_tts(self, pieces: List[Dict], output_dir: Path,
-                                 indexes: Optional[List[int]] = None) -> List[Path]:
-        """使用 MiMo TTS 以自然语速生成配音"""
-        semaphore = asyncio.Semaphore(self.concurrency)
-
-        async def run_one(idx: int, text: str) -> Path:
-            # 同步 HTTP 调用放入线程池执行，信号量限制并发
-            async with semaphore:
-                return await asyncio.to_thread(
-                    self._generate_mimo_one, idx, text, output_dir)
-
-        indexes = indexes or list(range(len(pieces)))
-        tasks = [run_one(idx, piece["text"])
-             for idx, piece in zip(indexes, pieces)]
-        # 任一条最终失败即取消其余任务并抛出异常，不让它们继续在后台请求 API
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        errors = [r for r in results if isinstance(r, BaseException)]
-        if errors:
-            for t in tasks:
-                t.cancel()
-            raise errors[0]
-
-        print(f"[TTS] MiMo TTS 配音生成完成")
         return results
 
 
@@ -1465,8 +1462,12 @@ def main():
                 and cache.get("source_sha") == source_sha
                 and isinstance(cache.get("translations"), list)):
             for i, t in enumerate(cache["translations"][:len(sentences)]):
-                if isinstance(t, str) and t.strip():
+                if (isinstance(t, str) and t.strip()
+                        and has_preserved_literals(sentences[i]["text"], t)):
                     done_map[i] = t
+                elif isinstance(t, str) and t.strip():
+                    print(f"[翻译] 缓存中的第 {i} 句改写了快捷键或代码字面量，"
+                          "将重新翻译")
             if done_map:
                 print(f"[翻译] 从缓存恢复 {len(done_map)}/{len(sentences)} 句译文: {cache_path}")
             if len(done_map) == len(sentences):
@@ -1524,7 +1525,7 @@ def main():
         try:
             # 配音合成仅在需要产出视频时进行；--no-video 模式只输出估算时间轴的 SRT
             if not args.no_video and not args.no_tts:
-                tts = TTSClient(tts_config, llm_config)
+                tts = TTSClient(tts_config)
                 if tts.enabled:
                     # 自然语速合成全部配音（此时还没有最终时间轴）
                     tts_files = asyncio.run(tts.generate_all(pieces, output_dir))
