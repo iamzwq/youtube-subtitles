@@ -24,41 +24,48 @@ import subprocess
 import sys
 import time
 import wave
-from collections import Counter
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
+import json_repair
+import miniaudio
+import numpy as np
 from openai import OpenAI
 
 
 # ==================== 配置加载 ====================
 
 DEFAULT_CONFIG = {
+    "global": {
+        "max_retries": 3,             # 网络 API（LLM/TTS）调用失败时的最大重试次数
+        "sample_rate": 48000,         # 配音音轨拼接采样率（Hz），影响音质与解码/混音精度
+        "target_chars_per_sec": 5.5   # 中文配音目标语速（字/秒），用于按原句时长估算译文字数预算
+    },
     "llm": {
-        "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
-        "api_key": "",
-        "model": "mimo-v2.5-pro",
-        "supports_system_role": False,
+        "base_url": "https://token-plan-cn.xiaomimimo.com/v1",  # LLM API 的 base_url（会自动补全 /v1 后缀）
+        "api_key": "",                     # LLM API Key，必填，否则脚本启动时会报错退出
+        "model": "mimo-v2.5-pro",          # 使用的模型名称
+        "supports_system_role": False,     # 模型是否支持独立的 system 角色消息（不支持则合并进 user 消息）
         "thinking": {
-            "type": "disabled"
+            "type": "disabled"             # 是否开启模型的思考/推理模式（部分模型支持，disabled 为关闭）
         },
-        "batch_size": 40,
-        "batch_max_chars": 8000
+        "batch_size": 40,          # 每批次最多翻译的句子数量
+        "batch_max_chars": 8000    # 每批次原文字符数上限（与 batch_size 双重约束，防止单批过长）
     },
     "tts": {
-        "enabled": True,
-        "engine": "edge-tts",
-        "voice": "zh-CN-YunyangNeural",
-        "rate": "+0%",
-        "volume": "+0%",
-        "pitch": "+0Hz",
-        "mix_with_original": False,
-        "batch_size": 50,
-        "concurrency": 5,
-        "max_tempo": 3.0
+        "enabled": True,                   # 是否生成中文配音（关闭则只输出估算时间轴的字幕）
+        "engine": "edge-tts",              # TTS 引擎，目前仅支持 edge-tts
+        "voice": "zh-CN-YunyangNeural",     # 配音音色
+        "rate": "+0%",                     # 语速调整（相对默认语速的百分比）
+        "volume": "+0%",                   # 音量调整（相对默认音量的百分比）
+        "pitch": "+0Hz",                   # 音调调整（相对默认音调的 Hz 偏移）
+        "mix_with_original": False,        # 是否保留原声并与配音按比例混合（否则完全替换为配音）
+        "batch_size": 50,                  # 每批次并发提交生成的配音条数（用于分批写入缓存）
+        "concurrency": 5,                  # 单批内实际并发请求 edge-tts 服务的数量
+        "max_tempo": 3.0                   # 配音超长时允许的最高加速倍速（超出此倍速的部分会被截断）
     },
     "subtitle": {
-        "max_chars_per_line": 35
+        "max_chars_per_line": 25   # 中文字幕单行最大字符数，超过则按标点拆分为多行
     }
 }
 
@@ -72,20 +79,16 @@ def has_speakable_text(text: str) -> bool:
     """
     return any(ch.isalnum() for ch in (text or ""))
 
-# 字幕中的非语音提示：[Music]/[Applause]/(upbeat music) 等方括号/圆括号注释，及音符符号。
-# 这类内容不是台词，不应翻译或显示，去除后若整句无可朗读内容则丢弃。
-NONSPEECH_ANNOTATION_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)|[\u266a\u266b\U0001f3b5\U0001f3b6]")
-
-PROTECTED_LITERAL_RE = re.compile(
-    r"""(?<![\w])(?:
-        (?:Ctrl|Alt|Shift|Cmd|Command|Option|Meta)(?:\+[A-Za-z0-9]+)+
-        |F(?:[1-9]|1[0-2])
-        |--?[A-Za-z][A-Za-z0-9-]*
-        |:[A-Za-z][A-Za-z0-9!]*
-        |[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+
-        |(?P<repeated_letter>[A-Za-z])(?P=repeated_letter)+
-    )(?![\w])""",
-    re.VERBOSE,
+# 字幕中的非语音提示：
+# 1. 方括号注释（如 [Music] / [Applause]）：通常全为音效/注释，全部清理；
+# 2. 圆括号注释：仅匹配包含明确非语音音效词汇（如 (applause), (upbeat music), (sighs) 等）的注释，
+#    避免误删正常台词中的圆括号内容（如 (like Vim) 或 (page 5)）；
+# 3. 音符符号（♪ ♫ 等）。
+NONSPEECH_ANNOTATION_RE = re.compile(
+    r"\[[^\]]*\]|"
+    r"\((?=[^)]*(?:music|applause|laughter|cheering|cheers|sigh|chuckle|gasp|groan|snicker|giggle|cough|throat|whisper|cackle|sob|grunt|scream|yawn|indistinct|chatter|scoff|snort))[^)]*\)|"
+    r"[\u266a\u266b\U0001f3b5\U0001f3b6]",
+    re.IGNORECASE,
 )
 
 def strip_nonspeech_annotations(text: str) -> str:
@@ -94,51 +97,97 @@ def strip_nonspeech_annotations(text: str) -> str:
     return re.sub(r"\s{2,}", " ", cleaned).strip()
 
 
-def protect_translation_literals(text: str,
-                                 sentence_id: int) -> Tuple[str, Dict[str, str]]:
-    """把快捷键、命令和代码字面量替换为可校验的不可翻译占位符。"""
-    replacements: Dict[str, str] = {}
-
-    def replace_literal(match: re.Match) -> str:
-        placeholder = f"[[KEEP_{sentence_id}_{len(replacements)}]]"
-        replacements[placeholder] = match.group(0)
-        return placeholder
-
-    return PROTECTED_LITERAL_RE.sub(replace_literal, text), replacements
+# 口语填充词（uh/um/hmm 等）：无实际语义，保留会让译文出现"呃""嗯"这类语气词。
+# 只收录纯拟声的填充词，不含 ah/oh 等可能承载语气或语义的感叹词。
+FILLER_WORD_RE = re.compile(
+    r"(?<![\w'-])(?:u+h+|u+m+|erm+|er|hm+|mhm+|呃+|嗯+)(?![\w'-])",
+    re.IGNORECASE,
+)
 
 
-def restore_translation_literals(source: str, translation: str,
-                                 sentence_id: int) -> Optional[str]:
-    """验证占位符并恢复字面量；丢失、重复或改写时返回 None。"""
-    _, replacements = protect_translation_literals(source, sentence_id)
-    restored = translation
-    for placeholder, literal in replacements.items():
-        if restored.count(placeholder) != 1:
-            return None
-        restored = restored.replace(placeholder, literal)
-
-    expected = Counter(replacements.values())
-    actual = Counter(
-        match.group(0) for match in PROTECTED_LITERAL_RE.finditer(restored)
-    )
-    if any(actual[literal] != count for literal, count in expected.items()):
-        return None
-    return restored
+def strip_filler_words(text: str) -> str:
+    """移除口语填充词，并清理删除后残留的多余标点与空白。"""
+    cleaned = FILLER_WORD_RE.sub(" ", text or "")
+    cleaned = re.sub(r"\s+(?=[,，.。!！?？;；:：])", "", cleaned)
+    cleaned = re.sub(r"([,，、;；])\s*(?=[,，、;；])", "", cleaned)
+    cleaned = re.sub(r"^[\s,，、;；:：.。…-]+", "", cleaned)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
 
 
-def has_preserved_literals(source: str, translation: str) -> bool:
-    """检查译文是否完整保留源句中的快捷键、命令和代码字面量。"""
-    expected = Counter(
-        match.group(0) for match in PROTECTED_LITERAL_RE.finditer(source)
-    )
-    actual = Counter(
-        match.group(0) for match in PROTECTED_LITERAL_RE.finditer(translation)
-    )
-    return all(actual[literal] == count for literal, count in expected.items())
+# 常见英文缩写表（避免分句时将 Dr., Mr., vs., Inc., e.g., etc. 等误识别为句尾标点）
+ENGLISH_ABBREVIATIONS = {
+    # 称谓与尊称
+    "dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st", "rev", "rep", "sen",
+    "gov", "gen", "col", "maj", "capt", "lt", "sgt", "cmdr", "adm", "hon",
+    # 常见 Latin 与通用缩写
+    "vs", "v", "eg", "ie", "etc", "approx", "app", "dept", "fig", "figs",
+    "no", "nos", "vol", "vols", "sec", "secs", "min", "mins", "hr", "hrs",
+    "sq", "ft", "in", "lbs", "oz", "yd", "mm", "cm", "m", "km",
+    # 商业与机构
+    "inc", "ltd", "co", "corp", "assn", "bros", "div", "est",
+    # 月份与星期
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "mon", "tue", "wed", "thu", "fri", "sat", "sun"
+}
 
-MAX_RETRIES = 3             # 网络 API 最大重试次数
-SAMPLE_RATE = 48000         # 拼接音轨的采样率
-TARGET_CHARS_PER_SEC = 5.5  # 中文配音目标语速（字/秒），用于按时长预算限制译文长度
+
+def is_abbreviation_or_non_sentence_period(word_text: str, next_word_text: Optional[str] = None) -> bool:
+    """判断以 '.' 结尾的词是否为英文缩写、首字母缩写、版本号/数字等非断句句号。"""
+    stripped = (word_text or "").rstrip()
+    if not stripped.endswith('.'):
+        return False
+
+    # 去除外层引号/括号/标点后取核心词
+    core = stripped.strip("\"'()[]{}«»“”‘’")
+    if not core.endswith('.'):
+        return False
+
+    # 1. 常见英文缩写表（如 Dr., Mr., vs., Inc., e.g., etc.）
+    stem = core[:-1].lower()
+    stem_nodot = core.replace(".", "").lower()
+    if stem in ENGLISH_ABBREVIATIONS or stem_nodot in ENGLISH_ABBREVIATIONS:
+        return True
+
+    # 2. 单个大写字母 + 点（人名中间名首字母，如 John F. Kennedy 中的 F.）
+    if re.match(r"^[A-Z]\.$", core):
+        return True
+
+    # 3. 多点首字母缩写（如 e.g., i.e., U.S., U.K., A.M., P.M., Ph.D.）
+    if re.match(r"^(?:[a-zA-Z]{1,3}\.){2,}$", core):
+        return True
+
+    # 4. 数字/版本号/小数（如 v1.0.，或 "3." 后紧跟数字 "14"）
+    if re.match(r"^\$?v?\d+(?:\.\d+)*\.$", core, re.IGNORECASE):
+        if next_word_text:
+            next_clean = next_word_text.lstrip()
+            if next_clean and (next_clean[0].islower() or next_clean[0].isdigit()):
+                return True
+
+    if next_word_text:
+        next_clean = next_word_text.lstrip()
+        # 如 "3." 后紧跟 "14" (小数切词)
+        if next_clean and next_clean[0].isdigit() and core[:-1].isdigit():
+            return True
+
+    return False
+
+
+GLOBAL_CONFIG = DEFAULT_CONFIG.get("global", {})
+MAX_RETRIES = int(GLOBAL_CONFIG.get("max_retries", 3))             # 网络 API 最大重试次数
+SAMPLE_RATE = int(GLOBAL_CONFIG.get("sample_rate", 48000))         # 拼接音轨的采样率
+TARGET_CHARS_PER_SEC = float(GLOBAL_CONFIG.get("target_chars_per_sec", 5.5))  # 中文配音目标语速（字/秒）
+
+
+def apply_global_config(config: Dict):
+    """根据加载的配置动态更新全局常量"""
+    global MAX_RETRIES, SAMPLE_RATE, TARGET_CHARS_PER_SEC
+    g = config.get("global", {})
+    if "max_retries" in g:
+        MAX_RETRIES = int(g["max_retries"])
+    if "sample_rate" in g:
+        SAMPLE_RATE = int(g["sample_rate"])
+    if "target_chars_per_sec" in g:
+        TARGET_CHARS_PER_SEC = float(g["target_chars_per_sec"])
 
 
 def load_config() -> Dict:
@@ -157,6 +206,8 @@ def load_config() -> Dict:
         print(f"[配置] 未找到配置文件，已生成模板: {config_path}")
         print("[配置] 请编辑该文件填入你的 API Key 后再运行")
         sys.exit(1)
+
+    apply_global_config(config)
 
     # 验证 LLM 配置
     llm = config.get("llm", {})
@@ -221,6 +272,29 @@ def strip_code_fence(text: str) -> str:
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text).strip()
     return text
+
+
+def _robust_json_loads(text: str) -> Optional[object]:
+    """健壮的 JSON 解析器：先尝试标准 json.loads，解析失败时使用 json_repair 修复并解析。"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    try:
+        return json_repair.loads(text)
+    except Exception:
+        pass
+
+    # 简易容错处理：移除末尾悬空逗号等
+    cleaned = re.sub(r",\s*([}\]])", r"\1", text)
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        return None
 
 
 def read_json_safe(path: Path) -> Optional[dict]:
@@ -480,10 +554,11 @@ def parse_json3(json3_path: Path) -> List[Dict]:
 
 
 def split_into_sentences(words: List[Dict]) -> List[Dict]:
-    """按标点分句"""
+    """按标点分句（智能排除英文缩写、首字母缩写、版本号/数字小数点等非断句句号）"""
     def make_sentence(ws: List[Dict]) -> Optional[Dict]:
         """把一组词组装成句子；纯标点/非语音注释/无实际内容的片段返回 None 丢弃"""
-        text = strip_nonspeech_annotations("".join(w["text"] for w in ws).strip())
+        text = strip_filler_words(
+            strip_nonspeech_annotations("".join(w["text"] for w in ws).strip()))
         if not has_speakable_text(text):
             return None
         return {
@@ -495,10 +570,16 @@ def split_into_sentences(words: List[Dict]) -> List[Dict]:
 
     sentences: List[Dict] = []
     current_words: List[Dict] = []
-    for word in words:
+    num_words = len(words)
+
+    for i, word in enumerate(words):
         current_words.append(word)
         stripped = word["text"].rstrip()
         if stripped and stripped[-1] in SENTENCE_END_PUNCT:
+            next_word_text = words[i + 1]["text"] if i + 1 < num_words else None
+            if stripped[-1] == '.' and is_abbreviation_or_non_sentence_period(word["text"], next_word_text):
+                continue
+
             sent = make_sentence(current_words)
             if sent:
                 sentences.append(sent)
@@ -609,21 +690,12 @@ class LLMClient:
 
             batch_result: Dict[int, str] = {}
             for attempt in range(1, MAX_RETRIES + 1):
-                content = self._chat(messages)
+                # 重试时适度提升 temperature（0.3 -> 0.5 -> 0.7），引入变化避免死锁
+                temp = 0.3 + (attempt - 1) * 0.2
+                content = self._chat(messages, temperature=temp)
                 parsed = self._parse_json_translations(
                     content, todo[0], todo[-1] + 1)
-                batch_result = {}
-                for sentence_id, sentence in zip(todo, sub_sentences):
-                    translated = parsed.get(sentence_id)
-                    if translated is None:
-                        continue
-                    restored = restore_translation_literals(
-                        sentence["text"], translated, sentence_id)
-                    if restored is not None:
-                        batch_result[sentence_id] = restored
-                    else:
-                        print(f"[警告] 第 {sentence_id} 句的快捷键或代码字面量"
-                              "被改写，将重新翻译")
+                batch_result = {i: parsed[i] for i in todo if i in parsed}
                 missing = [i for i in todo if i not in batch_result]
                 if not missing:
                     break
@@ -652,13 +724,12 @@ class LLMClient:
         text = strip_code_fence(content)
         begin = text.find("[")
         end = text.rfind("]")
-        if begin == -1 or end == -1 or end <= begin:
-            return {}
-
-        try:
-            data = json.loads(text[begin:end + 1])
-        except json.JSONDecodeError:
-            return {}
+        if begin != -1 and end != -1 and end > begin:
+            data = _robust_json_loads(text[begin:end + 1])
+            if data is None:
+                data = _robust_json_loads(text)
+        else:
+            data = _robust_json_loads(text)
 
         result: Dict[int, str] = {}
         if isinstance(data, list):
@@ -678,51 +749,41 @@ class LLMClient:
     def _build_prompt(sentences: List[Dict], title: str, description: str, ids: List[int],
                       glossary: Optional[List[Dict]] = None) -> str:
         numbered_lines = []
-        literal_lines = []
         for sentence_id, sentence in zip(ids, sentences):
-            protected, replacements = protect_translation_literals(
-                sentence["text"], sentence_id)
-            # 按原句时长×目标语速算出字数预算；仅当自然译文预计会超预算
-            # （信息密集句）时才附字数提示，避免无谓约束时间充裕的句子
+            # 按原句时长×目标语速算出字数预算；
+            # 极短句（<1秒）按实际时长比例缩减保底字数（如 max(2, round(dur * 5.5))），
+            # 避免固定保底 6 字导致配音语速极端过快（例如 0.4 秒读 6 字达 15 字/秒）。
             duration_ms = max(sentence["end_ms"] - sentence["start_ms"], 0)
-            budget = max(round(duration_ms / 1000 * TARGET_CHARS_PER_SEC), 6)
+            duration_sec = duration_ms / 1000.0
+            if duration_sec < 1.0:
+                budget = max(2, round(duration_sec * TARGET_CHARS_PER_SEC))
+            else:
+                budget = max(4, round(duration_sec * TARGET_CHARS_PER_SEC))
             est_zh_chars = len(sentence["text"].split()) * 1.8
             if est_zh_chars > budget:
-                numbered_lines.append(f"{sentence_id}. [≤{budget}字] {protected}")
+                numbered_lines.append(
+                    f"{sentence_id}. [≤{budget}字] {sentence['text']}")
             else:
-                numbered_lines.append(f"{sentence_id}. {protected}")
-            literal_lines.extend(
-                f"- {placeholder} = {literal}"
-                for placeholder, literal in replacements.items()
-            )
+                numbered_lines.append(f"{sentence_id}. {sentence['text']}")
         numbered_text = "\n".join(numbered_lines)
-        literal_block = ""
-        if literal_lines:
-            literal_block = (
-                "\n不可翻译占位符（译文中必须逐字保留每个占位符且恰好出现一次；"
-                "不要直接输出等号右侧的原文，程序会自动恢复）：\n"
-                + "\n".join(literal_lines)
-                + "\n"
-            )
         description = (description or "").strip() or "（无简介）"
 
         glossary_block = ""
         if glossary:
             terms = "\n".join(f"- {item['term']} → {item['zh']}" for item in glossary)
             glossary_block = (f"\n统一术语表（下列词条的译文必须严格采用给定译法，不得自行改译）：\n"
-                              f"{terms}\n")
+                             f"{terms}\n")
 
         return f"""你是一位专业的视频字幕翻译师。请将以下视频字幕翻译成中文。
 
 视频标题：{title}
 视频简介：{description}
 {glossary_block}
-{literal_block}
 以下是视频的一段字幕文本，每句前面有编号。请严格逐句翻译，不要合并或拆分句子，不要遗漏任何一句。译文应自然流畅，符合中文表达习惯，适合作为视频字幕。
 
 部分句子编号后带有 [≤N字] 参考字数（由配音时间预算算出，只出现在信息较密的句子上）：请尽量精简、靠近该字数，以免配音语速过快。但忠实与自然优先：若精简会损失关键信息或使中文生硬，可适当超出——绝不可为压字数而遗漏、简化或臆造信息。未标字数的句子按正常翻译即可。
 
-原文中未替换为占位符的快捷键、代码、命令或界面文字等英文/数字字面量，也必须逐字符原样保留，不得翻译、纠错、改变大小写或改变字符数量。
+快捷键、命令、代码和界面文字等英文/数字字面量请原样保留，不要翻译或“纠错”。特别注意：像 zz、qq、dd 这类重复字母很可能是真实的按键序列（如 Vim 按键），不是拼写错误，不得删减重复字母。
 
 输出要求：只输出一个 JSON 数组，每个元素格式为 {{"id": 编号, "zh": "该句中文译文"}}。编号可能与其它批次重叠或看起来不连续，但必须与原句前面的编号完全一致，一个都不能改、不能漏。不要输出 markdown 代码块标记，不要输出任何解释。
 
@@ -760,12 +821,12 @@ class LLMClient:
 
         content = strip_code_fence(self._chat([{"role": "user", "content": prompt}]))
         begin, end = content.find("["), content.rfind("]")
-        if begin == -1 or end == -1 or end <= begin:
-            return []
-        try:
-            data = json.loads(content[begin:end + 1])
-        except json.JSONDecodeError:
-            return []
+        if begin != -1 and end != -1 and end > begin:
+            data = _robust_json_loads(content[begin:end + 1])
+            if data is None:
+                data = _robust_json_loads(content)
+        else:
+            data = _robust_json_loads(content)
 
         result = []
         if isinstance(data, list):
@@ -802,18 +863,66 @@ class LLMClient:
 def split_long_sentence(text: str, max_chars: int) -> List[str]:
     """仅在标点符号处把超长文本拆成多条（无标点的超长子句保持完整，不做硬切）。
 
+    带有成对标点保护（《》、“”、‘’、（）等内不切断）与连续省略号（.../……）保护。
     只负责文本切分，不涉及任何时间信息；真实时间轴由后续的
     build_layout 根据 TTS 实测时长决定。
     """
-    delimiters = ['，', '、', '；', ',', ';', '。', '！', '？', '…']
+    delimiters = {'，', '、', '；', ',', ';', '。', '！', '？', '…', '!', '?', '.'}
 
-    # 第一遍：按标点切成子句
+    pair_open = {'“': '”', '‘': '’', '《': '》', '（': '）', '(': ')', '【': '】', '[': ']', '"': '"', "'": "'"}
+    pair_close = {'”': '“', '’': '‘', '》': '《', '）': '（', ')': '(', '】': '【', ']': '['}
+
+    # 第一遍：按标点切成子句（带有状态机保护）
     clauses = []
     last_end = 0
-    for i, char in enumerate(text):
-        if char in delimiters and i > 5:
-            clauses.append(text[last_end:i+1])
-            last_end = i + 1
+    stack: List[str] = []
+
+    i = 0
+    while i < len(text):
+        char = text[i]
+
+        # 跟踪成对标点开闭
+        if char in ('"', "'"):
+            if stack and stack[-1] == char:
+                stack.pop()
+            else:
+                stack.append(char)
+        elif char in pair_open:
+            stack.append(char)
+        elif char in pair_close:
+            if stack and stack[-1] == pair_close[char]:
+                stack.pop()
+
+        in_pair = len(stack) > 0
+        is_delimiter = False
+        cut_index = i + 1
+
+        if not in_pair and char in delimiters and i > 5:
+            # 防护 (1)：数字千分位或小数点 (如 46,000 / 3.14)
+            if (char in (',', '，', '.') and i + 1 < len(text)
+                    and text[i - 1].isdigit() and text[i + 1].isdigit()):
+                is_delimiter = False
+            # 防护 (2)：连续英文点/省略号 (如 ... 或 ……)，吃完所有连续点后再断
+            elif char in ('.', '…'):
+                next_i = i
+                while next_i < len(text) and text[next_i] in ('.', '…'):
+                    next_i += 1
+                # 如果是单个点且紧跟字母/数字（如 Dr. Smith / e.g.），不作为句尾断点
+                if next_i - i == 1 and char == '.' and next_i < len(text) and text[next_i].isalnum():
+                    is_delimiter = False
+                else:
+                    is_delimiter = True
+                    cut_index = next_i
+                    i = next_i - 1  # 游标跳过整个省略号
+            else:
+                is_delimiter = True
+
+        if is_delimiter:
+            clauses.append(text[last_end:cut_index])
+            last_end = cut_index
+
+        i += 1
+
     if last_end < len(text):
         clauses.append(text[last_end:])
 
@@ -831,17 +940,33 @@ def split_long_sentence(text: str, max_chars: int) -> List[str]:
     if buffer:
         parts.append(buffer)
 
-    return parts
+    # 把纯标点片段并回相邻片段：单独一个标点无法合成语音，会让 TTS 报错
+    merged: List[str] = []
+    for part in parts:
+        if merged and not has_speakable_text(part):
+            merged[-1] += part
+        else:
+            merged.append(part)
+    if len(merged) > 1 and not has_speakable_text(merged[0]):
+        merged[1] = merged[0] + merged[1]
+        del merged[0]
+
+    return merged
 
 
 def postprocess_subtitles(sentences: List[Dict], translations: List[str],
                           max_chars: int) -> List[Dict]:
-    """把译文切成字幕片段（纯文本规则，不含时间信息）。
+    """按句聚合为配音单元（每句一个 TTS 合成单元 + 供屏幕展示的多行拆分）。
 
-    - 超过 max_chars 的译文按标点拆成多条；
-    - 纯标点/无实际内容的译文（无法 TTS）跳过；
-    - 每个片段记录所属英文句子的时间跨度（span_start/span_end），
-      真实起止时间由后续 build_layout 根据配音实测时长决定。
+    每个单元包含：
+    - text: 完整译文，作为 TTS 的合成输入（保留完整语境，修复多音字失去
+      上下文导致误读的问题，如把"第一行"拆开会让 TTS 丢失"行"的读音线索）；
+    - lines: 供字幕屏幕展示的多行文本（超过 max_chars 时按标点拆分），
+      仅用于 SRT 渲染，不参与 TTS 合成；
+    - span_start/span_end: 原句时间跨度，真实起止时间由后续 build_layout
+      根据整句配音实测时长决定，再按字符比例切分给各展示行。
+
+    纯标点/无实际内容的译文（无法 TTS）会被跳过。
     """
     result = []
 
@@ -852,18 +977,16 @@ def postprocess_subtitles(sentences: List[Dict], translations: List[str],
             continue
 
         if len(trans) > max_chars:
-            for part in split_long_sentence(trans, max_chars):
-                result.append({
-                    "text": part.strip(),
-                    "span_start": sent["start_ms"],
-                    "span_end": sent["end_ms"],
-                })
+            lines = [p.strip() for p in split_long_sentence(trans, max_chars)]
         else:
-            result.append({
-                "text": trans,
-                "span_start": sent["start_ms"],
-                "span_end": sent["end_ms"],
-            })
+            lines = [trans]
+
+        result.append({
+            "text": trans,
+            "lines": lines,
+            "span_start": sent["start_ms"],
+            "span_end": sent["end_ms"],
+        })
 
     return result
 
@@ -1050,20 +1173,28 @@ class TTSClient:
 def mix_tts_audio(clips: List[Dict], output_audio: Path):
     """将各配音片段按最终时间轴混入完整音轨（numpy 实现，替代 amix 滤镜）。
 
-    clips: build_layout 的输出，每项含 start_ms 与 file。
+    clips: build_layout 的输出。同一整句若被拆成多行展示，会共用同一个
+    音频文件（file 相同）——这里按 file 去重，只在整句的起始时间混入一次，
+    避免同一段配音被重复叠加播放。
     """
     if not clips:
         return
 
-    try:
-        import numpy as np
-    except ImportError:
-        raise RuntimeError("音频拼接需要 numpy，请先安装: pip install numpy")
-
     clips = sorted(clips, key=lambda c: c["start_ms"])
+
+    # 按音频文件去重：同一文件只取第一次出现（即整句起始时间）
+    seen_files = set()
+    audio_clips = []
+    for clip in clips:
+        f = clip.get("file")
+        if not f or f in seen_files:
+            continue
+        seen_files.add(f)
+        audio_clips.append(clip)
+
     decoded = []
     total_samples = SAMPLE_RATE  # 至少留 1 秒尾部
-    for clip in clips:
+    for clip in audio_clips:
         pcm = _decode_to_pcm16(clip["file"])
         offset = int(clip["start_ms"]) * SAMPLE_RATE // 1000
         decoded.append([offset, pcm])
@@ -1071,7 +1202,7 @@ def mix_tts_audio(clips: List[Dict], output_audio: Path):
 
     # 防止语音重叠的兜底：正常情况下新时间轴不会重叠，仅当某句组触发最高倍速
     # 仍超长时才会发生。超出部分直接截断并淡出。
-    FADE_SAMPLES = 480  # 10ms @ 48kHz
+    FADE_SAMPLES = int(SAMPLE_RATE * 0.01)  # 10ms 淡出
     truncated = 0
     for i in range(len(decoded)):
         offset, pcm = decoded[i]
@@ -1104,29 +1235,44 @@ def mix_tts_audio(clips: List[Dict], output_audio: Path):
     print(f"[音频] 已拼接 {len(clips)} 条配音: {output_audio}")
 
 
-def _decode_to_pcm16(path: Path):
-    """用 ffmpeg 把任意音频解码为 48kHz 单声道 s16le PCM，返回 numpy 数组"""
-    import numpy as np
-    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(path),
-           "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "pipe:1"]
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"音频解码失败: {path}\n{result.stderr.decode(errors='ignore')}")
-    return np.frombuffer(result.stdout, dtype=np.int16)
+def _decode_to_pcm16(path: Path, sample_rate: Optional[int] = None) -> np.ndarray:
+    """使用 miniaudio 将音频解码为单声道 s16le PCM，返回 numpy 数组（异常时回退 ffmpeg）。"""
+    sr = sample_rate or SAMPLE_RATE
+
+    try:
+        decoded = miniaudio.decode_file(
+            str(path),
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=1,
+            sample_rate=sr,
+        )
+        return np.frombuffer(decoded.samples, dtype=np.int16)
+    except Exception:
+        # 回退 ffmpeg 单文件解码
+        cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(path),
+               "-ac", "1", "-ar", str(sr), "-f", "s16le", "pipe:1"]
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"音频解码失败: {path}\n{result.stderr.decode(errors='ignore')}")
+        return np.frombuffer(result.stdout, dtype=np.int16)
 
 
 def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
                  max_tempo: float = 3.0,
                  known_durations: Optional[List[Optional[int]]] = None
                  ) -> List[Dict]:
-    """为字幕片段计算最终时间轴（字幕与配音共用同一套时间）。
+    """为字幕计算最终时间轴（字幕与配音共用同一套时间）。
 
-    有真实配音时按实测时长排布（优先用 known_durations 中生成阶段已缓存
-    的时长，否则回退到当场 probe）——同一句子的整组片段
-    放不下时统一加速（上限 max_tempo），字幕切换时刻与语音完全同步；
+    pieces 中每项对应一句完整译文的 TTS 合成单元（含 text 全句 + lines 展示行）。
+    有真实配音时按整句实测时长排布（优先用 known_durations 中生成阶段已缓存
+    的时长，否则回退到当场 probe）——句子本身放不下时按 max_tempo 上限加速，
+    字幕整体切换时刻与语音完全同步；随后按各展示行的字符数比例，把整句时长
+    分摊给屏幕上显示的多行字幕（仅影响显示切换时刻，不影响音频，因为音频是
+    整句合成，不再按行拆分，从而保留完整语境供 TTS 消歧多音字）。
     无音频（--no-tts / --no-video 模式）时退化为按 130ms/字 估算排布。
 
-    返回 [{text, start_ms, end_ms, file, tempo}, ...]，按时间升序。
+    返回 [{text, start_ms, end_ms, file, tempo}, ...]，按时间升序；
+    同句的多行展示项共用同一个 file 与 tempo（音频不重复生成/加速）。
     """
     EST_MS_PER_CHAR = 130  # 无实测时长时的退化估算值
 
@@ -1139,64 +1285,74 @@ def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
             dur = probe_duration_ms(tts_files[idx])
         if dur is None:
             dur = len(piece["text"]) * EST_MS_PER_CHAR
-        durations.append(max(int(dur), 200))  # 单片最短 200ms，防异常数据
+        durations.append(max(int(dur), 200))  # 单句最短 200ms，防异常数据
 
     layout = []
-    i = 0
-    while i < len(pieces):
-        # 找出同一英文句子跨度下的连续片段（postprocess 保证了它们相邻）
-        j = i
-        while (j < len(pieces)
-               and pieces[j]["span_start"] == pieces[i]["span_start"]
-               and pieces[j]["span_end"] == pieces[i]["span_end"]):
-            j += 1
-        group = pieces[i:j]
-        group_dur = durations[i:j]
-        span_start = group[0]["span_start"]
-        span_end = group[0]["span_end"]
+    sped_count = 0
+    max_tempo_seen = 1.0
+
+    for i, piece in enumerate(pieces):
+        span_start = piece["span_start"]
+        span_end = piece["span_end"]
+        dur = durations[i]
 
         # 借用到下一句开始前的静音间隙，给配音更多空间以减少加速
         # （末句无后继，保持自身跨度）
-        if j < len(pieces):
-            effective_end = max(span_end, pieces[j]["span_start"])
+        if i + 1 < len(pieces):
+            effective_end = max(span_end, pieces[i + 1]["span_start"])
         else:
             effective_end = span_end
 
-        total = sum(group_dur)
         avail = max(effective_end - span_start, 0)
         tempo = 1.0
-        if total > avail > 0:
-            raw = total / avail
+        if dur > avail > 0:
+            raw = dur / avail
             tempo = min(raw, max_tempo)
             if raw > max_tempo:
-                print(f"[警告] {ms_to_srt_time(span_start)} 起的字幕组严重超长："
-                      f"配音需 {total}ms / 可用 {avail}ms，"
+                print(f"[警告] {ms_to_srt_time(span_start)} 起的字幕严重超长："
+                      f"配音需 {dur}ms / 可用 {avail}ms，"
                       f"已按最高 {max_tempo}x 加速，超出部分可能被截断")
 
+        total_adj = max(int(dur / tempo), 100)  # 保底 100ms 防零时长
+        if tempo > 1.005:
+            sped_count += 1
+            max_tempo_seen = max(max_tempo_seen, tempo)
+
+        # 按字符数比例，把整句配音时长分摊给各展示行（仅影响字幕切换时刻）
+        lines = piece.get("lines") or [piece["text"]]
+        char_counts = [max(len(line), 1) for line in lines]
+        total_chars = sum(char_counts)
+
         t = span_start
-        for k, piece in enumerate(group):
-            adj = max(int(group_dur[k] / tempo), 100)  # 保底 100ms 防零时长
+        for k, line in enumerate(lines):
+            is_last = (k == len(lines) - 1)
+            if is_last:
+                line_dur = total_adj - (t - span_start)
+            else:
+                line_dur = max(int(total_adj * char_counts[k] / total_chars), 1)
+            line_dur = max(line_dur, 1)
             layout.append({
-                "text": piece["text"],
+                "text": line,
                 "start_ms": t,
-                "end_ms": t + adj,
-                "file": tts_files[i + k] if tts_files else None,
+                "end_ms": t + line_dur,
+                "file": tts_files[i] if tts_files else None,
                 "tempo": tempo,
             })
-            t += adj
+            t += line_dur
 
-        i = j
+    if sped_count:
+        print(f"[时间轴] {sped_count} 条配音已按所在句子统一倍速加速"
+              f"（最高 {max_tempo_seen:.2f}x）")
 
-    sped = [e for e in layout if e["tempo"] > 1.005]
-    if sped:
-        print(f"[时间轴] {len(sped)} 条配音已按所在句组的统一倍速加速"
-              f"（最高 {max(e['tempo'] for e in sped):.2f}x）")
-
-    # 对需要加速的音频统一应用 atempo（每个文件恰好对应一个片段）
+    # 对需要加速的音频统一应用 atempo（每个 TTS 文件只加速一次，即使对应多行展示）
     if tts_files:
+        fitted_cache: Dict[Path, Path] = {}
         for entry in layout:
-            if entry["file"] and entry["tempo"] > 1.005:
-                entry["file"] = speed_up_audio(entry["file"], entry["tempo"])
+            f = entry["file"]
+            if f and entry["tempo"] > 1.005:
+                if f not in fitted_cache:
+                    fitted_cache[f] = speed_up_audio(f, entry["tempo"])
+                entry["file"] = fitted_cache[f]
 
     return layout
 
@@ -1237,13 +1393,24 @@ def probe_duration_ms(path: Path) -> Optional[int]:
 
 
 def _escape_filter_path(p: Path) -> str:
-    """转义并包裹 FFmpeg 滤镜参数中的路径（处理盘符冒号、反斜杠、空格与引号）。
+    r"""转义并包裹 FFmpeg 滤镜参数中的路径。
 
-    用单引号包裹后，路径中的空格、冒号都会被当作字面量处理；
-    内部的单引号用 '\'' 序列转义（关闭引号→转义引号→重新开启）。
+    处理 Windows 盘符冒号（C:\）、反斜杠、空格与单引号：
+    1. 优先转换为相对于当前工作目录的 POSIX 相对路径，消除盘符冒号转义的复杂度；
+    2. 若无法获取相对路径（如跨盘符），转换为 POSIX 绝对路径，并将盘符冒号转义为 '\:'；
+    3. 用单引号包裹路径，并将路径内部的单引号转义为 '\''。
     """
-    s = str(p).replace("\\", "/").replace("'", "'\\''")
-    return f"'{s}'"
+    p_abs = p.resolve()
+    try:
+        rel = p_abs.relative_to(Path.cwd().resolve())
+        posix_str = rel.as_posix()
+    except ValueError:
+        posix_str = p_abs.as_posix()
+        if len(posix_str) > 1 and posix_str[1] == ":":
+            posix_str = posix_str[0] + r"\:" + posix_str[2:]
+
+    escaped = posix_str.replace("'", r"'\''")
+    return f"'{escaped}'"
 
 
 _NVENC_AVAILABLE: Optional[bool] = None
@@ -1269,10 +1436,12 @@ def has_nvenc() -> bool:
         )
         if "h264_nvenc" not in (listed.stdout or ""):
             return False
-        # 用 1 帧测试图真正编码一次，确认驱动/显卡可用
+        # 用 1 帧测试图真正编码一次，确认驱动/显卡可用。
+        # 尺寸不能太小：NVENC 对 H.264 有最小分辨率限制，过小的测试图会直接失败
         probe = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "nullsrc=s=64x64",
-             "-frames:v", "1", "-c:v", "h264_nvenc", "-f", "null", "-"],
+            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "nullsrc=s=1280x720",
+             "-frames:v", "1", "-pix_fmt", "yuv420p",
+             "-c:v", "h264_nvenc", "-f", "null", "-"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         _NVENC_AVAILABLE = probe.returncode == 0
@@ -1308,7 +1477,7 @@ def compose_final_video(video_path: Path, srt_path: Optional[Path],
                   + ("" if allow_nvenc else "（已通过 --no-nvenc 禁用 GPU）"))
     video_args = _video_encode_args(use_nvenc)
 
-    sub_style = "FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=0,MarginV=5"
+    sub_style = "FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=0,MarginV=1"
     cmd = ["ffmpeg", "-y", "-i", str(video_path)]
 
     if srt_path and audio_path:
@@ -1413,12 +1582,8 @@ def translate_sentences(llm_config: Dict, sentences: List[Dict],
             and cache.get("source_sha") == source_sha
             and isinstance(cache.get("translations"), list)):
         for i, t in enumerate(cache["translations"][:len(sentences)]):
-            if (isinstance(t, str) and t.strip()
-                    and has_preserved_literals(sentences[i]["text"], t)):
+            if isinstance(t, str) and t.strip():
                 done_map[i] = t
-            elif isinstance(t, str) and t.strip():
-                print(f"[翻译] 缓存中的第 {i} 句改写了快捷键或代码字面量，"
-                      "将重新翻译")
         if done_map:
             print(f"[翻译] 从缓存恢复 {len(done_map)}/{len(sentences)} 句译文: {cache_path}")
 
