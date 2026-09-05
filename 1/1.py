@@ -316,13 +316,66 @@ def sanitize_filename(name: str, max_len: int = 60) -> str:
     return cleaned[:max_len].strip()
 
 
-def _stream_subprocess(cmd: List[str], label: str,
-                       log_interval_s: Optional[float] = None) -> Tuple[int, str]:
-    """运行子进程并实时把合并后的 stdout/stderr 转发到控制台。
+_YTDLP_PROGRESS_RE = re.compile(
+    r"\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+~?([^\s]+)(?:\s+at\s+([^\s]+))?(?:\s+ETA\s+([^\s]+)|\s+in\s+([^\s]+))?"
+)
+_FFMPEG_TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+_FFMPEG_SPEED_RE = re.compile(r"speed=\s*([^\s]+)")
 
-    按 \\r 或 \\n 切分逐行打印（兼容 ffmpeg 用 \\r 刷新的进度行）。
-    log_interval_s 设置后，控制台日志最多按指定间隔输出一次。
-    返回 (returncode, 尾部输出文本)，供失败时报告错误详情。
+
+def _make_ascii_bar(pct: float, width: int = 20) -> str:
+    """生成 ASCII 进度条，例如 [=========>----------]"""
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(width * pct / 100.0))
+    if filled == 0:
+        bar = "-" * width
+    elif filled == width:
+        bar = "=" * width
+    else:
+        bar = "=" * (filled - 1) + ">" + "-" * (width - filled)
+    return f"[{bar}]"
+
+
+def _format_time_s(seconds: float) -> str:
+    """将秒数格式化为 HH:MM:SS 或 MM:SS"""
+    s = int(round(seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+    return f"{m:02d}:{sec:02d}"
+
+
+def get_video_duration(video_path: Path) -> Optional[float]:
+    """使用 ffprobe 获取视频总时长（秒）"""
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        res = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(video_path)
+            ],
+            capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return float(res.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def _stream_subprocess(cmd: List[str], label: str,
+                       log_interval_s: Optional[float] = None,
+                       total_duration_s: Optional[float] = None) -> Tuple[int, str]:
+    """运行子进程并实时在控制台显示结果。
+
+    在交互式终端 (isatty) 下，为 yt-dlp 和 FFmpeg 动态呈现单行进度条；
+    非终端模式（重定向/管道）下回退为普通间隔日志。
+    返回 (returncode, 尾部输出文本)。
     """
     proc = subprocess.Popen(
         cmd,
@@ -332,20 +385,78 @@ def _stream_subprocess(cmd: List[str], label: str,
     tail: List[str] = []
     buf = ""
     last_log_at = 0.0
+    in_progress_bar = False
+    is_tty = sys.stdout.isatty()
+
+    def clear_progress_bar():
+        nonlocal in_progress_bar
+        if in_progress_bar and is_tty:
+            sys.stdout.write("\r" + " " * 79 + "\r")
+            sys.stdout.flush()
+            in_progress_bar = False
 
     def print_line(line: str, force: bool = False):
-        nonlocal last_log_at
+        nonlocal last_log_at, in_progress_bar
         line = line.strip()
         if not line:
             return
-        now = time.monotonic()
-        if (force or log_interval_s is None
-                or now - last_log_at >= log_interval_s):
-            print(f"[{label}] {line}")
-            last_log_at = now
+
         tail.append(line)
         if len(tail) > 60:
             del tail[:-60]
+
+        now = time.monotonic()
+
+        if is_tty:
+            if label == "yt-dlp":
+                m = _YTDLP_PROGRESS_RE.search(line)
+                if m:
+                    pct = float(m.group(1))
+                    size = m.group(2)
+                    speed = m.group(3)
+                    eta = m.group(4) or m.group(5)
+                    bar = _make_ascii_bar(pct)
+                    speed_str = f" | {speed}" if speed and speed != "Unknown" else ""
+                    eta_str = f" | ETA {eta}" if eta and eta != "Unknown" else ""
+                    disp = f"\r[yt-dlp] 下载进度: {bar} {pct:5.1f}% | {size}{speed_str}{eta_str}"
+                    sys.stdout.write(disp.ljust(79))
+                    sys.stdout.flush()
+                    in_progress_bar = True
+                    last_log_at = now
+                    return
+
+            elif label == "FFmpeg":
+                m_time = _FFMPEG_TIME_RE.search(line)
+                if m_time:
+                    h, m_val, s_val = int(m_time.group(1)), int(m_time.group(2)), float(m_time.group(3))
+                    curr_sec = h * 3600 + m_val * 60 + s_val
+                    m_speed = _FFMPEG_SPEED_RE.search(line)
+                    speed_str = f" | {m_speed.group(1)}" if m_speed else ""
+                    curr_str = _format_time_s(curr_sec)
+
+                    if total_duration_s and total_duration_s > 0:
+                        pct = min(100.0, max(0.0, curr_sec / total_duration_s * 100.0))
+                        bar = _make_ascii_bar(pct)
+                        total_str = _format_time_s(total_duration_s)
+                        disp = f"\r[FFmpeg] 合成进度: {bar} {pct:5.1f}% ({curr_str} / {total_str}){speed_str}"
+                    else:
+                        disp = f"\r[FFmpeg] 正在合成: time={curr_str}{speed_str}"
+
+                    sys.stdout.write(disp.ljust(79))
+                    sys.stdout.flush()
+                    in_progress_bar = True
+                    last_log_at = now
+                    return
+
+            # 非进度信息行：如果此前展示了进度条，先擦除
+            clear_progress_bar()
+            print(f"[{label}] {line}")
+            last_log_at = now
+        else:
+            # 非 tty 模式：按 log_interval_s 间隔记录输出
+            if force or log_interval_s is None or now - last_log_at >= log_interval_s:
+                print(f"[{label}] {line}")
+                last_log_at = now
 
     while True:
         chunk = proc.stdout.read1(4096)  # 有多少读多少，保证实时
@@ -357,25 +468,52 @@ def _stream_subprocess(cmd: List[str], label: str,
             print_line(line)
     if buf.strip():
         print_line(buf, force=True)
+
+    if in_progress_bar and is_tty:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
     code = proc.wait()
     return code, "\n".join(tail)
 
 
-def run_yt_dlp(args: List[str], stream: bool = False) -> subprocess.CompletedProcess:
+def run_yt_dlp(args: List[str], stream: bool = False,
+               retry_on_429: bool = True) -> subprocess.CompletedProcess:
     """运行 yt-dlp 命令。
 
     stream=True 时实时转发下载日志到控制台（返回值的 stderr 仅含尾部输出）；
     默认静默捕获全部输出（--dump-json 需要解析完整 stdout，必须用默认模式）。
+    包含 429 Too Many Requests 指数退避自动重试机制。
     """
     cmd = ["yt-dlp"] + args
     print(f"[yt-dlp] {' '.join(cmd)}")
-    if stream:
-        code, tail = _stream_subprocess(cmd, "yt-dlp")
-        return subprocess.CompletedProcess(cmd, code, stdout="", stderr=tail)
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if result.returncode != 0:
-        print(f"[yt-dlp stderr] {result.stderr}", file=sys.stderr)
-    return result
+
+    attempts = MAX_RETRIES if retry_on_429 else 1
+    last_res = None
+
+    for attempt in range(1, attempts + 1):
+        if stream:
+            code, tail = _stream_subprocess(cmd, "yt-dlp")
+            last_res = subprocess.CompletedProcess(cmd, code, stdout="", stderr=tail)
+        else:
+            last_res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+        if last_res.returncode == 0:
+            return last_res
+
+        output_text = (last_res.stderr or "") + (last_res.stdout or "")
+        is_429 = "429" in output_text or "Too Many Requests" in output_text or "HTTP Error 429" in output_text
+
+        if is_429 and attempt < attempts:
+            wait_sec = 5 * (2 ** (attempt - 1))  # 5s, 10s, 20s...
+            print(f"[yt-dlp] 触发 YouTube 限流 (HTTP 429 Too Many Requests)，等待 {wait_sec} 秒后进行第 {attempt + 1}/{attempts} 次重试...", file=sys.stderr)
+            time.sleep(wait_sec)
+        else:
+            if not stream and last_res.returncode != 0:
+                print(f"[yt-dlp stderr] {last_res.stderr}", file=sys.stderr)
+            break
+
+    return last_res
 
 
 def get_video_metadata(url: str) -> Dict:
@@ -455,6 +593,7 @@ def download_video_and_subs(url: str, output_dir: Path, sub_langs: str,
             "--sub-format", "json3",
             "--write-thumbnail",
             "--convert-thumbnails", "jpg",
+            "--sleep-subtitles", "2",
             "-o", template,
             url,
         ]
@@ -1510,8 +1649,9 @@ def compose_final_video(video_path: Path, srt_path: Optional[Path],
 
     cmd.append(str(output_path))
 
-    print("[FFmpeg] 正在合成最终视频（实时日志如下）...")
-    code, tail = _stream_subprocess(cmd, "FFmpeg", log_interval_s=5.0)
+    print("[FFmpeg] 正在合成最终视频...")
+    total_dur = get_video_duration(video_path)
+    code, tail = _stream_subprocess(cmd, "FFmpeg", total_duration_s=total_dur)
 
     if code != 0:
         print(f"[FFmpeg 错误] 输出尾部:\n{tail}", file=sys.stderr)
