@@ -977,18 +977,38 @@ class LLMClient:
                         result.append({"term": term, "zh": zh})
         return result
 
-    def translate_title(self, title: str, description: str = "") -> Optional[str]:
-        """翻译视频标题（用于最终视频文件命名），失败返回 None"""
+    def translate_title(self, title: str, description: str = "",
+                        content_summary: str = "") -> Optional[str]:
+        """翻译/改写视频标题（用于最终视频文件命名），失败返回 None。
+
+        欧美视频标题风格与国内自媒体差异较大，有时原标题过于宽泛、噱头化，
+        或需要结合上下文才能理解，直译后中文读者难以第一时间判断视频讲了什么。
+        因此这里不再要求"只翻译"，而是让模型先判断原标题是否已经能清楚地
+        表明视频内容：能的话就直译/意译；不能的话，则结合视频简介和字幕内容，
+        重新拟一个符合中文自媒体习惯、简洁抓重点的标题（而非逐字翻译）。
+        """
         if not title or title == "Unknown":
             return None
         prompt = (
-            "请把下面的视频标题翻译成简洁自然的中文，只输出译文本身，"
-            "不要引号、不要解释、不要保留原文。\n"
-            f"标题：{title}\n"
+            "你是一名中文自媒体编辑，需要为下面这个视频确定最终的中文标题（用于视频文件命名和展示）。\n"
+            "欧美视频标题的风格和国内自媒体常有差异：有的原标题信息量不足、过于宽泛或依赖上下文，"
+            "直译成中文后读者无法一眼看出视频到底讲了什么。\n\n"
+            "请按以下规则判断并处理：\n"
+            "1. 如果原标题本身已经能清楚表明视频的具体内容，直接把它翻译成简洁自然的中文标题；\n"
+            "2. 如果原标题比较空泛、标题党、或者需要结合简介/字幕才能看出实际内容，"
+            "请不要逐字直译，而是结合下面提供的视频简介和字幕内容，重新拟一个能准确概括视频内容、"
+            "符合中文自媒体表达习惯的标题（可以适度提炼重点、增加信息量，但不要夸大或编造事实）。\n\n"
+            f"原标题：{title}\n"
         )
         desc = (description or "").strip()
         if desc:
-            prompt += f"（视频简介供参考：{desc[:200]}）\n"
+            prompt += f"视频简介：{desc[:300]}\n"
+        summary = (content_summary or "").strip()
+        if summary:
+            prompt += f"字幕内容节选（供理解视频实际讲的内容，仅供参考不要照抄）：\n{summary}\n"
+        prompt += (
+            "\n只输出最终确定的中文标题本身，不要输出判断过程、不要引号、不要解释、不要保留原文。"
+        )
 
         content = self._chat([{"role": "user", "content": prompt}])
         # 去掉可能存在的代码围栏，取第一行，再去掉包裹的引号
@@ -1737,7 +1757,11 @@ def translate_sentences(llm_config: Dict, sentences: List[Dict],
         save_cache({i: t for i, t in enumerate(translations)})
         print(f"[翻译] 结果已缓存: {cache_path}")
 
-    title_zh = translate_title_cached(llm, title, description, cache_path)
+    # 取前面若干句译文拼成摘要，供标题改写时理解视频实际内容
+    summary_source = [t for t in translations if t] or [s["text"] for s in sentences]
+    content_summary = " ".join(summary_source[:30])[:600]
+
+    title_zh = translate_title_cached(llm, title, description, cache_path, content_summary)
 
     for i, t in enumerate(translations[:3]):
         print(f"  译{i+1}: {t[:60]}...")
@@ -1746,15 +1770,15 @@ def translate_sentences(llm_config: Dict, sentences: List[Dict],
 
 
 def translate_title_cached(llm: "LLMClient", title: str, description: str,
-                           cache_path: Path) -> Optional[str]:
-    """翻译视频标题（用于最终视频文件命名），结果写入缓存，失败返回 None。"""
+                           cache_path: Path, content_summary: str = "") -> Optional[str]:
+    """翻译/改写视频标题（用于最终视频文件命名），结果写入缓存，失败返回 None。"""
     cached = read_json_safe(cache_path) or {}
     t = cached.get("title_zh")
     if isinstance(t, str) and t.strip():
         return t.strip()
 
     try:
-        title_zh = llm.translate_title(title, description)
+        title_zh = llm.translate_title(title, description, content_summary)
     except Exception as e:
         print(f"[警告] 标题翻译失败，将使用原标题命名: {e}", file=sys.stderr)
         return None
