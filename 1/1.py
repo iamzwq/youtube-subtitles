@@ -9,15 +9,17 @@ YouTube 视频自动下载 + 词级字幕翻译 + 纯中文 SRT 字幕生成 + �
 3. 解析字幕 → 按标点分句 → 记录每句首尾词时间
 4. 调用 LLM 整篇翻译（带标题/简介上下文 + 统一术语表）
 5. 时间对齐 → 生成纯中文 SRT 字幕
-6. 中文配音：使用 edge-tts；按实测语音时长自动排布字幕与配音的时间轴
+6. 中文配音：使用 edge-tts 或 MiMo 语音克隆 (mimo-v2.5-tts-voiceclone)；按实测语音时长自动排布字幕与配音的时间轴
 7. 字幕烧录 + 配音一步合成最终视频（--no-tts 可跳过配音）
 8. 翻译结果本地缓存（逐批保存），中断后重跑自动断点续传
 """
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
+import mimetypes
 import re
 import shutil
 import subprocess
@@ -54,15 +56,24 @@ DEFAULT_CONFIG = {
     },
     "tts": {
         "enabled": True,                   # 是否生成中文配音（关闭则只输出估算时间轴的字幕）
-        "engine": "edge-tts",              # TTS 引擎，目前仅支持 edge-tts
-        "voice": "zh-CN-YunyangNeural",     # 配音音色
-        "rate": "+0%",                     # 语速调整（相对默认语速的百分比）
-        "volume": "+0%",                   # 音量调整（相对默认音量的百分比）
-        "pitch": "+0Hz",                   # 音调调整（相对默认音调的 Hz 偏移）
+        "engine": "edge-tts",              # TTS 引擎，可选 "edge-tts" 或 "mimo-voiceclone"
+        "voice": "zh-CN-YunyangNeural",     # 配音音色（engine 为 edge-tts 时使用）
+        "rate": "+0%",                     # 语速调整（相对默认语速的百分比，仅 edge-tts 支持）
+        "volume": "+0%",                   # 音量调整（相对默认音量的百分比，仅 edge-tts 支持）
+        "pitch": "+0Hz",                   # 音调调整（相对默认音调的 Hz 偏移，仅 edge-tts 支持）
         "mix_with_original": False,        # 是否保留原声并与配音按比例混合（否则完全替换为配音）
         "batch_size": 50,                  # 每批次并发提交生成的配音条数（用于分批写入缓存）
-        "concurrency": 5,                  # 单批内实际并发请求 edge-tts 服务的数量
-        "max_tempo": 3.0                   # 配音超长时允许的最高加速倍速（超出此倍速的部分会被截断）
+        "concurrency": 5,                  # 单批内实际并发请求 TTS 服务的数量
+        "max_tempo": 3.0,                  # 配音超长时允许的最高加速倍速（超出此倍速的部分会被截断）
+        "mimo": {
+            # engine 为 "mimo-voiceclone" 时使用，基于参考人声样本复刻音色
+            "base_url": "https://api.xiaomimimo.com/v1",  # MiMo TTS API 的 base_url
+            "api_key": "",                       # MiMo TTS API Key；留空则复用 llm.api_key
+            "model": "mimo-v2.5-tts-voiceclone",  # 语音克隆模型名称
+            "reference_audio": "",   # 参考人声音频路径（如 extract_vocals.py 提取出的 *_vocals.wav）
+            "style_instruction": "",  # 可选：自然语言风格指令（放入 user 消息，用于控制语气/情绪）
+            "format": "wav"           # 输出音频格式，wav 或 mp3
+        }
     },
     "subtitle": {
         "max_chars_per_line": 25   # 中文字幕单行最大字符数，超过则按标点拆分为多行
@@ -1173,27 +1184,78 @@ def generate_srt(subs: List[Dict], output_path: Path):
 class TTSClient:
     """统一 TTS 客户端"""
 
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, llm_config: Optional[Dict] = None):
         self.engine = config.get("engine", "edge-tts")
         self.enabled = config.get("enabled", True)
         self.mix_with_original = config.get("mix_with_original", False)
         self.batch_size = max(1, int(config.get("batch_size", 50)))
         self.concurrency = max(1, int(config.get("concurrency", 5)))
         self.max_tempo = max(1.0, float(config.get("max_tempo", 3.0)))
-        cache_config = {key: value for key, value in config.items()
-                        if key not in {"api_key"}}
+
+        # 缓存签名不纳入任何 api_key 字段（含 mimo.api_key 嵌套项），避免密钥变更导致误判缓存失效，
+        # 也避免密钥被写入缓存指纹
+        def _strip_api_keys(d: Dict) -> Dict:
+            return {k: (_strip_api_keys(v) if isinstance(v, dict) else v)
+                    for k, v in d.items() if k != "api_key"}
+
         self.cache_signature = hashlib.sha1(
-            json.dumps(cache_config, sort_keys=True,
+            json.dumps(_strip_api_keys(config), sort_keys=True,
                        ensure_ascii=False).encode("utf-8")
         ).hexdigest()
 
-        if self.engine != "edge-tts":
+        if self.engine == "edge-tts":
+            self.voice = config.get("voice", "zh-CN-YunyangNeural")
+            self.rate = config.get("rate", "+0%")
+            self.volume = config.get("volume", "+0%")
+            self.pitch = config.get("pitch", "+0Hz")
+            print(f"[TTS] 引擎: edge-tts, 音色: {self.voice}")
+        elif self.engine == "mimo-voiceclone":
+            mimo_config = config.get("mimo", {})
+            base_url = (mimo_config.get("base_url")
+                        or "https://api.xiaomimimo.com/v1").rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url += "/v1"
+            api_key = mimo_config.get("api_key") or (llm_config or {}).get("api_key")
+            if not api_key:
+                raise ValueError(
+                    "mimo-voiceclone 引擎需要 tts.mimo.api_key（或复用 llm.api_key）")
+            reference_audio = mimo_config.get("reference_audio")
+            if not reference_audio:
+                raise ValueError(
+                    "mimo-voiceclone 引擎需要 tts.mimo.reference_audio 指定参考人声音频路径"
+                    "（可用 extract_vocals.py 提取出的 *_vocals.wav/mp3）")
+            reference_path = Path(reference_audio)
+            if not reference_path.exists():
+                raise ValueError(f"参考人声音频不存在: {reference_path}")
+
+            mime_type = mimetypes.guess_type(str(reference_path))[0]
+            if mime_type not in ("audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav"):
+                # 按扩展名兜底（mimetypes 在部分平台可能识别不到 mp3/wav）
+                suffix = reference_path.suffix.lower()
+                mime_type = {"mp3": "audio/mpeg", "wav": "audio/wav"}.get(
+                    suffix.lstrip("."), None)
+            if mime_type is None:
+                raise ValueError(
+                    f"参考人声音频格式不支持（仅支持 mp3/wav）: {reference_path}")
+            if mime_type in ("audio/mpeg", "audio/mp3"):
+                mime_type = "audio/mpeg"
+
+            with open(reference_path, "rb") as f:
+                reference_bytes = f.read()
+            reference_b64 = base64.b64encode(reference_bytes).decode("utf-8")
+            if len(reference_b64) > 10 * 1024 * 1024:
+                raise ValueError(
+                    "参考人声音频过大：Base64 编码后不能超过 10 MB，请先裁剪或压缩")
+            self.mimo_voice_data_uri = f"data:{mime_type};base64,{reference_b64}"
+
+            self.mimo_model = mimo_config.get("model", "mimo-v2.5-tts-voiceclone")
+            self.mimo_format = mimo_config.get("format", "wav")
+            self.mimo_style_instruction = mimo_config.get("style_instruction", "") or ""
+            self.mimo_client = OpenAI(api_key=api_key, base_url=base_url, timeout=120)
+            print(f"[TTS] 引擎: mimo-voiceclone, 模型: {self.mimo_model}, "
+                  f"参考音频: {reference_path.name}")
+        else:
             raise ValueError(f"不支持的 TTS 引擎: {self.engine}")
-        self.voice = config.get("voice", "zh-CN-YunyangNeural")
-        self.rate = config.get("rate", "+0%")
-        self.volume = config.get("volume", "+0%")
-        self.pitch = config.get("pitch", "+0Hz")
-        print(f"[TTS] 引擎: edge-tts, 音色: {self.voice}")
 
     async def generate_all(self, pieces: List[Dict], output_dir: Path
                            ) -> Tuple[List[Path], List[Optional[int]]]:
@@ -1206,7 +1268,7 @@ class TTSClient:
             return [], []
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        extension = "mp3"
+        extension = "mp3" if self.engine == "edge-tts" else self.mimo_format
         manifest_path = output_dir / "tts_cache.json"
         manifest = read_json_safe(manifest_path) or {}
         entries = manifest.get("entries")
@@ -1254,7 +1316,9 @@ class TTSClient:
             batch_indexes = missing[batch_start:batch_start + self.batch_size]
             batch_pieces = [pieces[idx] for idx in batch_indexes]
             try:
-                batch_files = await self._generate_edge_tts(
+                generate_fn = (self._generate_edge_tts if self.engine == "edge-tts"
+                               else self._generate_mimo_voiceclone)
+                batch_files = await generate_fn(
                     batch_pieces, output_dir, batch_indexes)
             except Exception:
                 entries = entries[:len(pieces)]
@@ -1326,6 +1390,56 @@ class TTSClient:
                 t.cancel()
             raise errors[0]
         print(f"[TTS] edge-tts 配音生成完成")
+        return results
+
+    async def _generate_mimo_voiceclone(self, pieces: List[Dict], output_dir: Path,
+                                        indexes: Optional[List[int]] = None) -> List[Path]:
+        """使用 MiMo mimo-v2.5-tts-voiceclone 基于参考人声音频克隆音色生成配音"""
+        semaphore = asyncio.Semaphore(self.concurrency)
+
+        def generate_one_sync(text: str) -> bytes:
+            messages = [
+                {"role": "user", "content": self.mimo_style_instruction},
+                {"role": "assistant", "content": text},
+            ]
+            response = self.mimo_client.chat.completions.create(
+                model=self.mimo_model,
+                messages=messages,
+                audio={"format": self.mimo_format, "voice": self.mimo_voice_data_uri},
+            )
+            audio = response.choices[0].message.audio
+            if audio is None or not audio.data:
+                raise RuntimeError("MiMo TTS 返回内容中没有音频数据")
+            return base64.b64decode(audio.data)
+
+        async def generate_one(idx: int, text: str) -> Path:
+            output_path = output_dir / f"tts_{idx:04d}.{self.mimo_format}"
+            async with semaphore:
+                for attempt in range(1, MAX_RETRIES + 1):
+                    try:
+                        audio_bytes = await asyncio.to_thread(generate_one_sync, text)
+                        output_path.write_bytes(audio_bytes)
+                        if not output_path.exists() or output_path.stat().st_size == 0:
+                            raise RuntimeError("服务端未返回音频数据")
+                        return output_path
+                    except Exception as e:
+                        if attempt == MAX_RETRIES:
+                            raise
+                        wait = 2 ** attempt
+                        print(f"[TTS] 第 {idx} 条生成失败 (第 {attempt}/{MAX_RETRIES} 次): {e}，{wait}s 后重试...")
+                        await asyncio.sleep(wait)
+
+        indexes = indexes or list(range(len(pieces)))
+        tasks = [generate_one(idx, piece["text"])
+             for idx, piece in zip(indexes, pieces)]
+        # 任一条最终失败即取消其余任务并抛出异常，不让它们继续在后台请求 API
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        errors = [r for r in results if isinstance(r, BaseException)]
+        if errors:
+            for t in tasks:
+                t.cancel()
+            raise errors[0]
+        print(f"[TTS] mimo-voiceclone 配音生成完成")
         return results
 
 
@@ -1910,7 +2024,7 @@ def main():
         try:
             # 配音合成仅在需要产出视频时进行；--no-video 模式只输出估算时间轴的 SRT
             if not args.no_video and not args.no_tts:
-                tts = TTSClient(tts_config)
+                tts = TTSClient(tts_config, llm_config)
                 if tts.enabled:
                     # 自然语速合成全部配音（此时还没有最终时间轴）
                     tts_files, tts_durations = asyncio.run(
