@@ -16,11 +16,30 @@
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+# Demucs 内部使用 tqdm 输出形如 "  12%|###   | 3/25 [00:05<00:32, 1.5s/it]" 的进度条，
+# 用于从普通日志行中识别出进度条行，以便原地刷新而不是逐行打印刷屏。
+PROGRESS_LINE_RE = re.compile(r"^\s*\d{1,3}%\|")
+
+
+def detect_device() -> str:
+    """检测可用的计算设备，返回 'cuda' 或 'cpu'，并打印检测结果。"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"[✓] 检测到 CUDA 加速可用，将使用 GPU: {gpu_name}")
+            return "cuda"
+    except ImportError:
+        pass
+    print("[!] 未检测到可用的 CUDA 环境，将使用 CPU 计算（速度较慢）")
+    return "cpu"
 
 
 def check_ffmpeg() -> str:
@@ -95,10 +114,15 @@ def run_demucs_extraction(
     audio_format: str = "wav"
 ) -> Path:
     """运行 demucs 提取人声。"""
+    resolved_device = detect_device() if device == "auto" else device
+    if device != "auto":
+        print(f"[*] 使用指定计算设备: {resolved_device}")
+
     cmd = [
         sys.executable, "-m", "demucs.separate",
         "-n", model_name,
         "-o", str(output_dir),
+        "-d", resolved_device,
     ]
 
     if two_stems:
@@ -106,9 +130,6 @@ def run_demucs_extraction(
 
     if audio_format.lower() in ["mp3", "flac"]:
         cmd.extend([f"--{audio_format.lower()}"])
-
-    if device != "auto":
-        cmd.extend(["-d", device])
 
     cmd.append(str(audio_path))
 
@@ -121,15 +142,37 @@ def run_demucs_extraction(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
         encoding="utf-8",
         errors="replace"
     )
 
+    # Demucs 用 tqdm 输出进度条（以 \r 原地刷新，而非 \n 换行）。
+    # 按字符读取并区分 \r / \n，让进度条在终端里原地刷新，其余日志正常换行输出。
     if proc.stdout:
-        for line in proc.stdout:
-            line_str = line.strip()
-            if line_str:
-                print(f"    {line_str}")
+        buf = ""
+        progress_active = False
+        while True:
+            ch = proc.stdout.read(1)
+            if ch == "":
+                break
+            if ch in ("\r", "\n"):
+                line = buf.strip()
+                buf = ""
+                if not line:
+                    continue
+                if PROGRESS_LINE_RE.match(line):
+                    print(f"\r    [进度] {line}", end="", flush=True)
+                    progress_active = True
+                else:
+                    if progress_active:
+                        print()  # 进度条后遇到普通日志行，换行避免覆盖
+                        progress_active = False
+                    print(f"    {line}")
+            else:
+                buf += ch
+        if progress_active:
+            print()
 
     proc.wait()
     elapsed = time.time() - start_time
