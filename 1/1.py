@@ -65,7 +65,11 @@ DEFAULT_CONFIG = {
         "mix_with_original": False,        # 是否保留原声并与配音按比例混合（否则完全替换为配音）
         "batch_size": 50,                  # 每批次并发提交生成的配音条数（用于分批写入缓存）
         "concurrency": 5,                  # 单批内实际并发请求 TTS 服务的数量
-        "max_tempo": 3.0,                  # 配音超长时允许的最高加速倍速（超出此倍速的部分会被截断）
+        "max_tempo": 3.0,                  # 配音超长时允许的最高加速倍速；若最高倍速仍放不下，不截断，
+                                           # 而是顺延挤占后续时间轴（由后续句子级联吸收延迟）
+        "min_tempo": 0.85,                 # 配音明显短于可用时长时允许的最低放慢倍速，用轻微放慢
+                                           # 填满可用时长、减少生硬的大段空白（放慢幅度设了下限，
+                                           # 避免语速过慢显得怪异，残余极少量空白是正常现象）
         "mimo": {
             # engine 为 "mimo-voiceclone" 时使用，基于参考人声样本复刻音色
             "base_url": "https://api.xiaomimimo.com/v1",  # MiMo TTS API 的 base_url
@@ -77,7 +81,10 @@ DEFAULT_CONFIG = {
         }
     },
     "subtitle": {
-        "max_chars_per_line": 25   # 中文字幕单行最大字符数，超过则按标点拆分为多行
+        "max_chars_per_line": 25,  # 中文字幕单行最大字符数，超过则按标点拆分为多行
+        "min_sentence_sec": 1.5,   # 原句时长低于该值时，与相邻句合并为一个翻译/配音单元，
+                                   # 避免过短时间槽导致配音要么被迫拉长要么严重加速
+        "max_merge_chars": 200     # 合并时原文字符数上限，防止连续短句无限合并成过长的单元
     }
 }
 
@@ -751,6 +758,59 @@ def split_into_sentences(words: List[Dict]) -> List[Dict]:
     return sentences
 
 
+def merge_short_sentences(sentences: List[Dict], min_sentence_sec: float = 1.5,
+                          max_merge_chars: int = 200) -> List[Dict]:
+    """把时长过短的相邻句子合并成一个翻译/配音单元。
+
+    原字幕（尤其自动字幕）常被切得很碎，短句独立配音时容易出现两种极端：
+    时间槽太窄被迫大幅加速，或配音很快读完后留下大段空白。把时长低于
+    min_sentence_sec 的句子与相邻句合并、整体翻译+配音，从源头上减少这两种
+    极端情况的发生频率（配合 build_layout 的流式时间轴双向调节，效果更好）。
+
+    合并策略：从前往后扫描，只要当前累积句的时长仍低于阈值，且合并后的原文
+    字符数未超过 max_merge_chars，就继续吸收下一句；达到阈值或长度上限后
+    结算成一个单元。合并单元的 start_ms/end_ms 取首尾句的跨度，text 用空格
+    拼接（保留自然的单词间隔，翻译时当作一整段话处理，语义更连贯）。
+    """
+    if not sentences:
+        return sentences
+
+    merged: List[Dict] = []
+    buffer: List[Dict] = None
+
+    def duration_sec(sent: Dict) -> float:
+        return max(sent["end_ms"] - sent["start_ms"], 0) / 1000.0
+
+    def flush():
+        nonlocal buffer
+        if buffer:
+            merged.append(buffer)
+        buffer = None
+
+    for sent in sentences:
+        if buffer is None:
+            buffer = dict(sent)
+            continue
+
+        buffer_short = duration_sec(buffer) < min_sentence_sec
+        combined_len = len(buffer["text"]) + 1 + len(sent["text"])
+        if buffer_short and combined_len <= max_merge_chars:
+            # 合并进当前缓冲：文本用空格拼接，时间跨度扩展到本句结尾
+            buffer["text"] = buffer["text"] + " " + sent["text"]
+            buffer["words"] = buffer["words"] + sent["words"]
+            buffer["end_ms"] = sent["end_ms"]
+        else:
+            flush()
+            buffer = dict(sent)
+
+    flush()
+
+    if len(merged) != len(sentences):
+        print(f"[分句] 短句合并: {len(sentences)} 句 -> {len(merged)} 句"
+              f"（阈值 {min_sentence_sec}s）")
+    return merged
+
+
 # ==================== LLM 翻译 ====================
 
 class LLMClient:
@@ -1199,6 +1259,7 @@ class TTSClient:
         self.batch_size = max(1, int(config.get("batch_size", 50)))
         self.concurrency = max(1, int(config.get("concurrency", 5)))
         self.max_tempo = max(1.0, float(config.get("max_tempo", 3.0)))
+        self.min_tempo = min(1.0, max(0.5, float(config.get("min_tempo", 0.85))))
 
         # 缓存签名不纳入任何 api_key 字段（含 mimo.api_key 嵌套项），避免密钥变更导致误判缓存失效，
         # 也避免密钥被写入缓存指纹
@@ -1539,17 +1600,26 @@ def _decode_to_pcm16(path: Path, sample_rate: Optional[int] = None) -> np.ndarra
 
 
 def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
-                 max_tempo: float = 3.0,
+                 max_tempo: float = 3.0, min_tempo: float = 0.85,
                  known_durations: Optional[List[Optional[int]]] = None
                  ) -> List[Dict]:
     """为字幕计算最终时间轴（字幕与配音共用同一套时间）。
 
     pieces 中每项对应一句完整译文的 TTS 合成单元（含 text 全句 + lines 展示行）。
-    有真实配音时按整句实测时长排布（优先用 known_durations 中生成阶段已缓存
-    的时长，否则回退到当场 probe）——句子本身放不下时按 max_tempo 上限加速，
-    字幕整体切换时刻与语音完全同步；随后按各展示行的字符数比例，把整句时长
-    分摊给屏幕上显示的多行字幕（仅影响显示切换时刻，不影响音频，因为音频是
-    整句合成，不再按行拆分，从而保留完整语境供 TTS 消歧多音字）。
+
+    与逐句锚定原始 ASR 时间戳的做法不同，这里采用**流式排布**：
+    - 每句的起始时间由"上一句配音实际结束时间"和"本句原始起始时间"共同决定，
+      不会因为原字幕时间戳的间隙而产生死板的静音空白；
+    - 配音明显短于原时间槽时，允许在 [min_tempo, 1.0) 范围内轻微放慢填充，
+      减少"读完早早留白"的观感（放慢幅度设了下限，避免语速过慢显得怪异）；
+    - 配音超出原时间槽时，优先"顺延挤占"后续本就存在的静音间隙（级联吸收，
+      不会像之前那样只借用紧邻下一句的间隙就没有余地了）；仍放不下才按
+      max_tempo 上限加速，此时不做截断，而是允许推迟后续所有句子的起始时间
+      （由 start_ms 使用上一句实际结束时间保证连贯，不会产生重叠）。
+
+    随后按各展示行的字符数比例，把整句时长分摊给屏幕上显示的多行字幕
+    （仅影响显示切换时刻，不影响音频，因为音频是整句合成，不再按行拆分，
+    从而保留完整语境供 TTS 消歧多音字）。
     无音频（--no-tts / --no-video 模式）时退化为按 130ms/字 估算排布。
 
     返回 [{text, start_ms, end_ms, file, tempo}, ...]，按时间升序；
@@ -1570,45 +1640,74 @@ def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
 
     layout = []
     sped_count = 0
+    slowed_count = 0
     max_tempo_seen = 1.0
+    min_tempo_seen = 1.0
+    total_delay_ms = 0  # 因前面句子超时累积的级联延迟
 
+    n = len(pieces)
     for i, piece in enumerate(pieces):
         span_start = piece["span_start"]
         span_end = piece["span_end"]
         dur = durations[i]
 
-        # 借用到下一句开始前的静音间隙，给配音更多空间以减少加速
-        # （末句无后继，保持自身跨度）
-        if i + 1 < len(pieces):
-            effective_end = max(span_end, pieces[i + 1]["span_start"])
-        else:
-            effective_end = span_end
+        # 起始时间：本句原始时间戳与"上一句实际结束时间 + 累积延迟"取较大者，
+        # 保证不与前一句重叠；配音早读完时不会强行贴原时间戳提前，也不会
+        # 因为原字幕间隙留下死板空白（下面用 avail 吸收间隙）。
+        actual_start = max(span_start, layout[-1]["_seg_end"] if layout else span_start)
 
-        avail = max(effective_end - span_start, 0)
+        # 可用时长：把本句原始跨度、以及后续连续句子之间的原始静音间隙
+        # 都作为预算来源（级联吸收多句间隙，而不只是紧邻下一句）。
+        nominal_span = max(span_end - span_start, 0)
+        gap_budget = 0
+        j = i + 1
+        while j < n:
+            prev_end = pieces[j - 1]["span_end"]
+            gap = max(pieces[j]["span_start"] - prev_end, 0)
+            if gap <= 0:
+                break
+            gap_budget += gap
+            j += 1
+        avail = max(nominal_span + gap_budget, 0)
+
         tempo = 1.0
         if dur > avail > 0:
+            # 配音超时：优先顺延挤占后续间隙，仍不够则按 max_tempo 加速
+            # （不做截断，级联延迟由后续句子的 actual_start 自动吸收）。
             raw = dur / avail
             tempo = min(raw, max_tempo)
             if raw > max_tempo:
-                print(f"[警告] {ms_to_srt_time(span_start)} 起的字幕严重超长："
+                print(f"[警告] {ms_to_srt_time(span_start)} 起的字幕明显超长："
                       f"配音需 {dur}ms / 可用 {avail}ms，"
-                      f"已按最高 {max_tempo}x 加速，超出部分可能被截断")
+                      f"已按最高 {max_tempo}x 加速，多余部分将顺延占用后续时间轴")
+        elif avail > 0 and dur < avail:
+            # 配音明显偏短：在 [min_tempo, 1.0) 范围内轻微放慢填充，减少空白；
+            # 差距过大时不做过度拉伸（避免语速失真），保留少量自然停顿即可。
+            raw = dur / avail
+            tempo = max(raw, min_tempo)
 
         total_adj = max(int(dur / tempo), 100)  # 保底 100ms 防零时长
         if tempo > 1.005:
             sped_count += 1
             max_tempo_seen = max(max_tempo_seen, tempo)
+        elif tempo < 0.995:
+            slowed_count += 1
+            min_tempo_seen = min(min_tempo_seen, tempo)
+
+        seg_end = actual_start + total_adj
+        if seg_end - span_end > 0:
+            total_delay_ms = max(total_delay_ms, seg_end - span_end)
 
         # 按字符数比例，把整句配音时长分摊给各展示行（仅影响字幕切换时刻）
         lines = piece.get("lines") or [piece["text"]]
         char_counts = [max(len(line), 1) for line in lines]
         total_chars = sum(char_counts)
 
-        t = span_start
+        t = actual_start
         for k, line in enumerate(lines):
             is_last = (k == len(lines) - 1)
             if is_last:
-                line_dur = total_adj - (t - span_start)
+                line_dur = total_adj - (t - actual_start)
             else:
                 line_dur = max(int(total_adj * char_counts[k] / total_chars), 1)
             line_dur = max(line_dur, 1)
@@ -1618,38 +1717,103 @@ def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
                 "end_ms": t + line_dur,
                 "file": tts_files[i] if tts_files else None,
                 "tempo": tempo,
+                "_seg_end": seg_end,  # 内部字段：本句（整句）实际结束时间，供下一句起始时间参考
             })
             t += line_dur
 
     if sped_count:
-        print(f"[时间轴] {sped_count} 条配音已按所在句子统一倍速加速"
-              f"（最高 {max_tempo_seen:.2f}x）")
+        print(f"[时间轴] {sped_count} 条配音已加速填充时间槽（最高 {max_tempo_seen:.2f}x）")
+    if slowed_count:
+        print(f"[时间轴] {slowed_count} 条配音已放慢填充时间槽（最低 {min_tempo_seen:.2f}x）")
+    if total_delay_ms > 0:
+        print(f"[时间轴] 因配音超时累积的最大顺延约 {total_delay_ms}ms（后续字幕/配音已顺延排布，不影响同步）")
 
-    # 对需要加速的音频统一应用 atempo（每个 TTS 文件只加速一次，即使对应多行展示）
+    # 对需要变速的音频统一处理（每个 TTS 文件只变速一次，即使对应多行展示）
     if tts_files:
         fitted_cache: Dict[Path, Path] = {}
         for entry in layout:
             f = entry["file"]
-            if f and entry["tempo"] > 1.005:
+            if f and abs(entry["tempo"] - 1.0) > 0.005:
                 if f not in fitted_cache:
                     fitted_cache[f] = speed_up_audio(f, entry["tempo"])
                 entry["file"] = fitted_cache[f]
 
+    # 清理内部字段，避免污染下游（生成 SRT / 混音）使用的数据结构
+    for entry in layout:
+        entry.pop("_seg_end", None)
+
     return layout
 
 
+_HAS_RUBBERBAND: Optional[bool] = None
+
+
+def has_rubberband_filter() -> bool:
+    """检测当前 ffmpeg 是否编译了 rubberband 滤镜（需要 --enable-librubberband）。
+
+    结果做进程内缓存，避免每次变速都重新探测。
+    """
+    global _HAS_RUBBERBAND
+    if _HAS_RUBBERBAND is None:
+        try:
+            result = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
+                                    capture_output=True, text=True)
+            _HAS_RUBBERBAND = "rubberband" in (result.stdout or "")
+        except Exception:
+            _HAS_RUBBERBAND = False
+    return _HAS_RUBBERBAND
+
+
+def _atempo_chain_filter(tempo: float) -> str:
+    """构造 atempo 滤镜表达式。
+
+    ffmpeg 的 atempo 单级只支持 0.5~2.0 倍速，超出范围需要链式串联多个 atempo
+    （如 3.0x 需拆成 2.0x * 1.5x）。
+    """
+    if 0.5 <= tempo <= 2.0:
+        return f"atempo={tempo:.4f}"
+
+    stages = []
+    remaining = tempo
+    if remaining > 2.0:
+        while remaining > 2.0:
+            stages.append(2.0)
+            remaining /= 2.0
+    else:
+        while remaining < 0.5:
+            stages.append(0.5)
+            remaining /= 0.5
+    stages.append(remaining)
+    return ",".join(f"atempo={s:.4f}" for s in stages)
+
+
 def speed_up_audio(path: Path, tempo: float) -> Path:
-    """用 ffmpeg atempo 生成指定倍速的临时音频。"""
+    """生成指定倍速的临时音频。
+
+    优先使用 ffmpeg 的 rubberband 滤镜（相位声码器变速，音质明显优于 atempo，
+    尤其在较大倍速时不易出现明显的音色失真/齿音），仅当 ffmpeg 未编译该滤镜
+    或调用失败时才回退到 atempo（超出 0.5~2.0 范围时自动链式串联）。
+    """
     tmp_path = path.with_suffix(".fitted" + path.suffix)
+
+    if has_rubberband_filter():
+        cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(path),
+               "-filter:a", f"rubberband=tempo={tempo:.4f}", str(tmp_path)]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0 and tmp_path.exists():
+            return tmp_path
+        print(f"[警告] rubberband 变速失败，回退 atempo: {result.stderr}", file=sys.stderr)
+        tmp_path.unlink(missing_ok=True)
+
     cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(path),
-           "-filter:a", f"atempo={tempo:.4f}", str(tmp_path)]
+           "-filter:a", _atempo_chain_filter(tempo), str(tmp_path)]
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode == 0 and tmp_path.exists():
         return tmp_path
     else:
         tmp_path.unlink(missing_ok=True)
-        print(f"[警告] 音频加速失败，保留原始配音: {result.stderr}", file=sys.stderr)
+        print(f"[警告] 音频变速失败，保留原始配音: {result.stderr}", file=sys.stderr)
         return path
 
 
@@ -1999,6 +2163,11 @@ def main():
         print("步骤 4: 按标点分句")
         print("=" * 60)
         sentences = split_into_sentences(words)
+        sentences = merge_short_sentences(
+            sentences,
+            min_sentence_sec=sub_config.get("min_sentence_sec", 1.5),
+            max_merge_chars=sub_config.get("max_merge_chars", 200),
+        )
 
         for i, s in enumerate(sentences[:3]):
             print(f"  句{i+1}: [{ms_to_srt_time(s['start_ms'])}] {s['text'][:60]}...")
@@ -2041,7 +2210,8 @@ def main():
             # 有实测时长则按真实语音排布（字幕与配音天然同步）；
             # 否则退化为按 130ms/字 估算排布
             max_tempo = tts.max_tempo if tts else 3.0
-            clips = build_layout(pieces, tts_files, max_tempo,
+            min_tempo = tts.min_tempo if tts else 0.85
+            clips = build_layout(pieces, tts_files, max_tempo, min_tempo,
                                  known_durations=tts_durations)
             srt_path = output_dir / f"{video_id}_zh.srt"
             generate_srt(clips, srt_path)
