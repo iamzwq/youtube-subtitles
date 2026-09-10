@@ -41,7 +41,8 @@ DEFAULT_CONFIG = {
     "global": {
         "max_retries": 3,             # 网络 API（LLM/TTS）调用失败时的最大重试次数
         "sample_rate": 48000,         # 配音音轨拼接采样率（Hz），影响音质与解码/混音精度
-        "target_chars_per_sec": 5.5   # 中文配音目标语速（字/秒），用于按原句时长估算译文字数预算
+        "target_chars_per_sec": 5.5,  # 中文配音目标语速（字/秒），用于按原句时长估算译文字数预算
+        "cookies_from_browser": ""    # yt-dlp 携带浏览器登录 Cookie，缓解 429 限流，如 "chrome"/"edge"/"firefox"，留空则不使用
     },
     "llm": {
         "base_url": "https://token-plan-cn.xiaomimimo.com/v1",  # LLM API 的 base_url（会自动补全 /v1 后缀）
@@ -187,11 +188,12 @@ GLOBAL_CONFIG = DEFAULT_CONFIG.get("global", {})
 MAX_RETRIES = int(GLOBAL_CONFIG.get("max_retries", 3))             # 网络 API 最大重试次数
 SAMPLE_RATE = int(GLOBAL_CONFIG.get("sample_rate", 48000))         # 拼接音轨的采样率
 TARGET_CHARS_PER_SEC = float(GLOBAL_CONFIG.get("target_chars_per_sec", 5.5))  # 中文配音目标语速（字/秒）
+COOKIES_FROM_BROWSER = (GLOBAL_CONFIG.get("cookies_from_browser") or "").strip()  # yt-dlp 使用的浏览器 Cookie 来源
 
 
 def apply_global_config(config: Dict):
     """根据加载的配置动态更新全局常量"""
-    global MAX_RETRIES, SAMPLE_RATE, TARGET_CHARS_PER_SEC
+    global MAX_RETRIES, SAMPLE_RATE, TARGET_CHARS_PER_SEC, COOKIES_FROM_BROWSER
     g = config.get("global", {})
     if "max_retries" in g:
         MAX_RETRIES = int(g["max_retries"])
@@ -199,6 +201,8 @@ def apply_global_config(config: Dict):
         SAMPLE_RATE = int(g["sample_rate"])
     if "target_chars_per_sec" in g:
         TARGET_CHARS_PER_SEC = float(g["target_chars_per_sec"])
+    if "cookies_from_browser" in g:
+        COOKIES_FROM_BROWSER = (g["cookies_from_browser"] or "").strip()
 
 
 def load_config() -> Dict:
@@ -496,7 +500,10 @@ def run_yt_dlp(args: List[str], stream: bool = False,
     默认静默捕获全部输出（--dump-json 需要解析完整 stdout，必须用默认模式）。
     包含 429 Too Many Requests 指数退避自动重试机制。
     """
-    cmd = ["yt-dlp"] + args
+    cmd = ["yt-dlp"]
+    if COOKIES_FROM_BROWSER:
+        cmd += ["--cookies-from-browser", COOKIES_FROM_BROWSER]
+    cmd += args
     print(f"[yt-dlp] {' '.join(cmd)}")
 
     attempts = MAX_RETRIES if retry_on_429 else 1
