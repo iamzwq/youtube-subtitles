@@ -776,7 +776,8 @@ def merge_short_sentences(sentences: List[Dict], min_sentence_sec: float = 1.5,
         return sentences
 
     merged: List[Dict] = []
-    buffer: List[Dict] = None
+    buffer: Optional[Dict] = None
+
 
     def duration_sec(sent: Dict) -> float:
         return max(sent["end_ms"] - sent["start_ms"], 0) / 1000.0
@@ -1830,9 +1831,6 @@ def probe_duration_ms(path: Path) -> Optional[int]:
         return int(float(result.stdout.strip()) * 1000)
     except ValueError:
         return None
-
-
-
 
 
 
