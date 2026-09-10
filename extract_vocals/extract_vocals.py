@@ -111,9 +111,15 @@ def run_demucs_extraction(
     model_name: str = "htdemucs",
     device: str = "auto",
     two_stems: str = "vocals",
-    audio_format: str = "wav"
+    audio_format: str = "wav",
+    shifts: int = 1,
+    overlap: float = 0.25,
 ) -> Path:
-    """运行 demucs 提取人声。"""
+    """运行 demucs 提取人声。
+
+    shifts: 随机偏移多次推理再平均，越大越准确但越慢（Demucs 官方推荐 5~10 可显著提升质量）。
+    overlap: 分段处理时的重叠比例，越大分段拼接处越平滑，但计算量增加。
+    """
     resolved_device = detect_device() if device == "auto" else device
     if device != "auto":
         print(f"[*] 使用指定计算设备: {resolved_device}")
@@ -123,6 +129,8 @@ def run_demucs_extraction(
         "-n", model_name,
         "-o", str(output_dir),
         "-d", resolved_device,
+        "--shifts", str(shifts),
+        "--overlap", str(overlap),
     ]
 
     if two_stems:
@@ -195,6 +203,31 @@ def run_demucs_extraction(
     return vocal_file
 
 
+def denoise_vocal_audio(vocal_path: Path, output_path: Path, ffmpeg_bin: str,
+                        strength: float = 12.0) -> bool:
+    """对 Demucs 分离出的人声做二次净化，压制残留的背景音/伴奏泄漏。
+
+    使用 ffmpeg afftdn（自适应频谱降噪）去除持续性背景噪声/伴奏残留，
+    配合 highpass 滤除低频隆隆声（鼓点/贝斯泄漏的主要频段），
+    afftdn 之后的 alimiter 防止降噪导致的电平突变。
+
+    strength: afftdn 的降噪强度（noise floor，单位 dB，越大降噪越强但越可能损伤人声）。
+    """
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-i", str(vocal_path),
+        "-af", f"highpass=f=80,afftdn=nf=-{strength},alimiter=limit=0.95",
+        str(output_path)
+    ]
+    print("[*] 正在对人声进行二次净化（降噪）...")
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if res.returncode != 0 or not output_path.exists():
+        print(f"[警告] 人声降噪失败，将保留未降噪版本: "
+              f"{res.stderr.decode(errors='ignore')}", file=sys.stderr)
+        return False
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="使用 Demucs AI 从视频或音频中一键提取人声 (Vocals)",
@@ -211,9 +244,9 @@ def main():
     )
     parser.add_argument(
         "-m", "--model",
-        default="htdemucs",
+        default="htdemucs_ft",
         choices=["htdemucs", "htdemucs_ft", "mdx_extra", "hdemucs_mmi"],
-        help="Demucs 分离模型 (默认: htdemucs，速度与效果兼优)"
+        help="Demucs 分离模型 (默认: htdemucs_ft，微调模型，质量优于 htdemucs 但更慢)"
     )
     parser.add_argument(
         "-f", "--format",
@@ -231,6 +264,29 @@ def main():
         "--keep-accompaniment",
         action="store_true",
         help="除了人声外，是否同时保留去除人声后的伴奏音频 (no_vocals)"
+    )
+    parser.add_argument(
+        "--shifts",
+        type=int,
+        default=2,
+        help="随机偏移多次推理再平均，越大质量越高但越慢 (默认: 2，追求极致质量可设为 5~10)"
+    )
+    parser.add_argument(
+        "--overlap",
+        type=float,
+        default=0.25,
+        help="分段处理重叠比例 (默认: 0.25，提高到 0.5~0.75 可减少分段拼接痕迹但更慢)"
+    )
+    parser.add_argument(
+        "--denoise",
+        action="store_true",
+        help="对分离出的人声做二次净化（ffmpeg 降噪），压制残留背景音/伴奏泄漏"
+    )
+    parser.add_argument(
+        "--denoise-strength",
+        type=float,
+        default=12.0,
+        help="二次净化的降噪强度，单位 dB (默认: 12，越大降噪越强但可能损伤人声)"
     )
 
     args = parser.parse_args()
@@ -295,8 +351,18 @@ def main():
             model_name=args.model,
             device=args.device,
             two_stems="vocals",
-            audio_format=args.format
+            audio_format=args.format,
+            shifts=args.shifts,
+            overlap=args.overlap,
         )
+
+        # 4.5 可选：对分离出的人声做二次净化，压制残留背景音/伴奏泄漏
+        if args.denoise and extracted_vocal_file and extracted_vocal_file.exists():
+            denoised_path = extracted_vocal_file.with_name(
+                f"{extracted_vocal_file.stem}_denoised{extracted_vocal_file.suffix}")
+            if denoise_vocal_audio(extracted_vocal_file, denoised_path, ffmpeg_bin,
+                                   strength=args.denoise_strength):
+                extracted_vocal_file = denoised_path
 
         # 5. 重命名并移动最终人声产物到目标位置
         if custom_final_name:
