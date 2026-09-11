@@ -7,9 +7,9 @@ YouTube 视频自动下载 + 词级字幕翻译 + 纯中文 SRT 字幕生成 + �
 1. 从视频元数据生成字幕语言候选列表（由 yt-dlp 自动匹配实际存在的轨道）
 2. 下载视频 + JSON3 词级字幕（输出目录为视频ID）
 3. 解析字幕 → 按标点分句 → 记录每句首尾词时间
-4. 调用 LLM 整篇翻译（带标题/简介上下文 + 统一术语表）
+4. 调用 LLM 逐句翻译（标题 + 前后文滑动窗口 + 统一术语表 + 按时长换算的字数预算）
 5. 时间对齐 → 生成纯中文 SRT 字幕
-6. 中文配音：使用 edge-tts 或 MiMo 语音克隆 (mimo-v2.5-tts-voiceclone)；按实测语音时长自动排布字幕与配音的时间轴
+6. 中文配音：使用 edge-tts 或 MiMo 语音克隆 (mimo-v2.5-tts-voiceclone)；按原句起点硬锚定排布字幕与配音的时间轴
 7. 字幕烧录 + 配音一步合成最终视频（--no-tts 可跳过配音）
 8. 翻译结果本地缓存（逐批保存），中断后重跑自动断点续传
 """
@@ -41,14 +41,19 @@ DEFAULT_CONFIG = {
     "global": {
         "max_retries": 3,             # 网络 API（LLM/TTS）调用失败时的最大重试次数
         "sample_rate": 48000,         # 配音音轨拼接采样率（Hz），影响音质与解码/混音精度
-        "target_chars_per_sec": 5.5,  # 中文配音目标语速（字/秒），用于按原句时长估算译文字数预算
-        "cookies_from_browser": ""    # yt-dlp 携带浏览器登录 Cookie，缓解 429 限流，如 "chrome"/"edge"/"firefox"，留空则不使用
+        "cookies_from_browser": "",   # yt-dlp 携带浏览器登录 Cookie，缓解 429 限流，如 "chrome"/"edge"/"firefox"，留空则不使用
+                                       # 注意：Chrome/Edge 等 Chromium 系浏览器运行时会锁定 cookie 数据库，
+                                       # 使用该方式前必须完全退出浏览器进程，否则报错 "Could not copy ... cookie database"；
+                                       # 如不方便每次关闭浏览器，改用 cookies_file 更省心
+        "cookies_file": ""             # 直接指定 Netscape 格式的 cookies.txt 文件路径（如用浏览器插件导出），
+                                       # 不依赖浏览器进程是否运行；同时配置时优先于 cookies_from_browser
     },
     "llm": {
         "base_url": "https://token-plan-cn.xiaomimimo.com/v1",  # LLM API 的 base_url（会自动补全 /v1 后缀）
         "api_key": "",                     # LLM API Key，必填，否则脚本启动时会报错退出
         "model": "mimo-v2.5-pro",          # 使用的模型名称
         "supports_system_role": False,     # 模型是否支持独立的 system 角色消息（不支持则合并进 user 消息）
+                                           # 只有 xiaomimimo 需要设置为 False，其他模型不需要设置，保持默认即可
         "thinking": {
             "type": "disabled"             # 是否开启模型的思考/推理模式（部分模型支持，disabled 为关闭）
         },
@@ -65,9 +70,9 @@ DEFAULT_CONFIG = {
         "mix_with_original": False,        # 是否保留原声并与配音按比例混合（否则完全替换为配音）
         "batch_size": 50,                  # 每批次并发提交生成的配音条数（用于分批写入缓存）
         "concurrency": 5,                  # 单批内实际并发请求 TTS 服务的数量
-        "max_tempo": 3.0,                  # 配音超长时允许的最高加速倍速；若最高倍速仍放不下，不截断，
-                                           # 而是顺延挤占后续时间轴（由后续句子级联吸收延迟）
-        "min_tempo": 0.85,                 # 配音明显短于可用时长时允许的最低放慢倍速，用轻微放慢
+        "max_tempo": 2.0,                  # 配音超长时允许的最高加速倍速；仍放不下则淡出截断，
+                                           # 绝不顺延到下一句，保证全片音画硬同步
+        "min_tempo": 1.0,                  # 配音明显短于可用时长时允许的最低放慢倍速，用轻微放慢
                                            # 填满可用时长、减少生硬的大段空白（放慢幅度设了下限，
                                            # 避免语速过慢显得怪异，残余极少量空白是正常现象）
         "mimo": {
@@ -81,7 +86,8 @@ DEFAULT_CONFIG = {
         }
     },
     "subtitle": {
-        "max_chars_per_line": 25,  # 中文字幕单行最大字符数，超过则按标点拆分为多行
+        "chars_per_sec": 4.2,      # 中文配音基准语速（字/秒）；按句子可用时长换算译文字数上限，
+                                   # 让 LLM 主动精简译文，从源头避免配音放不进原时间槽
         "min_sentence_sec": 1.5,   # 原句时长低于该值时，与相邻句合并为一个翻译/配音单元，
                                    # 避免过短时间槽导致配音要么被迫拉长要么严重加速
         "max_merge_chars": 200     # 合并时原文字符数上限，防止连续短句无限合并成过长的单元
@@ -194,22 +200,22 @@ def is_abbreviation_or_non_sentence_period(word_text: str, next_word_text: Optio
 GLOBAL_CONFIG = DEFAULT_CONFIG.get("global", {})
 MAX_RETRIES = int(GLOBAL_CONFIG.get("max_retries", 3))             # 网络 API 最大重试次数
 SAMPLE_RATE = int(GLOBAL_CONFIG.get("sample_rate", 48000))         # 拼接音轨的采样率
-TARGET_CHARS_PER_SEC = float(GLOBAL_CONFIG.get("target_chars_per_sec", 5.5))  # 中文配音目标语速（字/秒）
 COOKIES_FROM_BROWSER = (GLOBAL_CONFIG.get("cookies_from_browser") or "").strip()  # yt-dlp 使用的浏览器 Cookie 来源
+COOKIES_FILE = (GLOBAL_CONFIG.get("cookies_file") or "").strip()  # yt-dlp 使用的 cookies.txt 文件路径
 
 
 def apply_global_config(config: Dict):
     """根据加载的配置动态更新全局常量"""
-    global MAX_RETRIES, SAMPLE_RATE, TARGET_CHARS_PER_SEC, COOKIES_FROM_BROWSER
+    global MAX_RETRIES, SAMPLE_RATE, COOKIES_FROM_BROWSER, COOKIES_FILE
     g = config.get("global", {})
     if "max_retries" in g:
         MAX_RETRIES = int(g["max_retries"])
     if "sample_rate" in g:
         SAMPLE_RATE = int(g["sample_rate"])
-    if "target_chars_per_sec" in g:
-        TARGET_CHARS_PER_SEC = float(g["target_chars_per_sec"])
     if "cookies_from_browser" in g:
         COOKIES_FROM_BROWSER = (g["cookies_from_browser"] or "").strip()
+    if "cookies_file" in g:
+        COOKIES_FILE = (g["cookies_file"] or "").strip()
 
 
 def load_config() -> Dict:
@@ -508,7 +514,10 @@ def run_yt_dlp(args: List[str], stream: bool = False,
     包含 429 Too Many Requests 指数退避自动重试机制。
     """
     cmd = ["yt-dlp"]
-    if COOKIES_FROM_BROWSER:
+    if COOKIES_FILE:
+        # cookies_file 优先于 cookies_from_browser：不依赖浏览器进程/锁文件，更稳定
+        cmd += ["--cookies", COOKIES_FILE]
+    elif COOKIES_FROM_BROWSER:
         cmd += ["--cookies-from-browser", COOKIES_FROM_BROWSER]
     cmd += args
     print(f"[yt-dlp] {' '.join(cmd)}")
@@ -765,7 +774,7 @@ def merge_short_sentences(sentences: List[Dict], min_sentence_sec: float = 1.5,
     原字幕（尤其自动字幕）常被切得很碎，短句独立配音时容易出现两种极端：
     时间槽太窄被迫大幅加速，或配音很快读完后留下大段空白。把时长低于
     min_sentence_sec 的句子与相邻句合并、整体翻译+配音，从源头上减少这两种
-    极端情况的发生频率（配合 build_layout 的流式时间轴双向调节，效果更好）。
+    极端情况（碎句按时长换算出的字数预算过小，译文写不下必然超时被截断）。
 
     合并策略：从前往后扫描，只要当前累积句的时长仍低于阈值，且合并后的原文
     字符数未超过 max_merge_chars，就继续吸收下一句；达到阈值或长度上限后
@@ -858,12 +867,14 @@ class LLMClient:
                 time.sleep(wait)
         raise RuntimeError(f"LLM 调用失败（已重试 {MAX_RETRIES} 次）: {last_err}")
 
-    def translate(self, sentences: List[Dict], title: str, description: str,
+    def translate(self, sentences: List[Dict], title: str,
+                  budgets: List[int],
                   done: Optional[Dict[int, str]] = None,
                   on_progress=None,
                   glossary: Optional[List[Dict]] = None) -> List[str]:
         """分批翻译所有句子（结构化 JSON 输出，按 id 对齐，避免错位）。
 
+        budgets: 与 sentences 对齐的每句中文字数上限（由可用时长换算）。
         done: 已有缓存译文的 {id: 译文}，这些句子不再重复请求（断点续传）。
         on_progress: 每完成一批后的回调 on_progress(results_dict)，用于增量写缓存。
         glossary: 全片统一术语表 [{term, zh}]，注入每个批次的 prompt 保证译名一致。
@@ -895,7 +906,13 @@ class LLMClient:
 
             # 保留全局真实编号，避免续传时错位
             sub_sentences = [sentences[i] for i in todo]
-            prompt = self._build_prompt(sub_sentences, title, description, todo, glossary)
+            # 滑动窗口：上文给已确定的中文译文，下文给尚未翻译的原文
+            prev_context = [results[i] for i in range(max(todo[0] - 3, 0), todo[0])
+                            if i in results]
+            next_preview = [s["text"] for s in sentences[todo[-1] + 1: todo[-1] + 4]]
+            prompt = self._build_prompt(
+                sub_sentences, title, todo, glossary,
+                [budgets[i] for i in todo], prev_context, next_preview)
 
             system_msg = "你是一位专业的视频字幕翻译师。你只输出合法的 JSON 数组，不输出任何其他内容。"
             if self.supports_system_role:
@@ -964,42 +981,38 @@ class LLMClient:
         return result
 
     @staticmethod
-    def _build_prompt(sentences: List[Dict], title: str, description: str, ids: List[int],
-                      glossary: Optional[List[Dict]] = None) -> str:
-        numbered_lines = []
-        for sentence_id, sentence in zip(ids, sentences):
-            # 按原句时长×目标语速算出字数预算；
-            # 极短句（<1秒）按实际时长比例缩减保底字数（如 max(2, round(dur * 5.5))），
-            # 避免固定保底 6 字导致配音语速极端过快（例如 0.4 秒读 6 字达 15 字/秒）。
-            duration_ms = max(sentence["end_ms"] - sentence["start_ms"], 0)
-            duration_sec = duration_ms / 1000.0
-            if duration_sec < 1.0:
-                budget = max(2, round(duration_sec * TARGET_CHARS_PER_SEC))
-            else:
-                budget = max(4, round(duration_sec * TARGET_CHARS_PER_SEC))
-            est_zh_chars = len(sentence["text"].split()) * 1.8
-            if est_zh_chars > budget:
-                numbered_lines.append(
-                    f"{sentence_id}. [≤{budget}字] {sentence['text']}")
-            else:
-                numbered_lines.append(f"{sentence_id}. {sentence['text']}")
+    def _build_prompt(sentences: List[Dict], title: str, ids: List[int],
+                      glossary: Optional[List[Dict]],
+                      budgets: List[int],
+                      prev_context: List[str],
+                      next_preview: List[str]) -> str:
+        numbered_lines = [
+            f"{sentence_id}. [中文不超过 {budget} 字] {sentence['text']}"
+            for sentence_id, sentence, budget in zip(ids, sentences, budgets)
+        ]
         numbered_text = "\n".join(numbered_lines)
-        description = (description or "").strip() or "（无简介）"
+
+        context_block = ""
+        if prev_context:
+            context_block += ("\n【上文参考（已翻译完成的前几句中文，仅用于保持语境与风格连贯）】\n"
+                              + "\n".join(f"- {t}" for t in prev_context) + "\n")
+        if next_preview:
+            context_block += ("\n【下文预览（后续原文，仅用于理解语境，不要翻译）】\n"
+                              + "\n".join(f"- {t}" for t in next_preview) + "\n")
 
         glossary_block = ""
         if glossary:
             terms = "\n".join(f"- {item['term']} → {item['zh']}" for item in glossary)
-            glossary_block = (f"\n统一术语表（下列词条的译文必须严格采用给定译法，不得自行改译）：\n"
-                             f"{terms}\n")
+            glossary_block = (f"\n【统一术语表（下列词条必须严格采用给定译法，译法与原文相同的词条必须原样输出、"
+                              f"一个字符都不能增删改）】\n{terms}\n")
 
         return f"""你是一位专业的视频字幕翻译师。请将以下视频字幕翻译成中文。
 
 视频标题：{title}
-视频简介：{description}
-{glossary_block}
-以下是视频的一段字幕文本，每句前面有编号。请严格逐句翻译，不要合并或拆分句子，不要遗漏任何一句。译文应自然流畅，符合中文表达习惯，适合作为视频字幕。
+{glossary_block}{context_block}
+请严格逐句翻译，不要合并或拆分句子，不要遗漏任何一句。译文应自然流畅，符合中文表达习惯，适合作为视频字幕。
 
-部分句子编号后带有 [≤N字] 参考字数（由配音时间预算算出，只出现在信息较密的句子上）：请尽量精简、靠近该字数，以免配音语速过快。但忠实与自然优先：若精简会损失关键信息或使中文生硬，可适当超出——绝不可为压字数而遗漏、简化或臆造信息。未标字数的句子按正常翻译即可。
+字数约束（重要）：每句前的 [中文不超过 N 字] 是该句配音可用时长换算出的硬性上限。请宁简勿繁，主动意译精简：删去可有可无的定语、语气词和重复表达，保留核心信息即可，不得超出字数上限。
 
 快捷键、命令、代码和界面文字等英文/数字字面量请原样保留，不要翻译或“纠错”。特别注意：像 zz、qq、dd 这类重复字母很可能是真实的按键序列（如 Vim 按键），不是拼写错误，不得删减重复字母。
 
@@ -1026,11 +1039,15 @@ class LLMClient:
 
         numbered = "\n".join(s["text"][:50] for s in picked)
 
-        prompt = f"""以下是某视频的全部字幕文本（每行一句）。请提取其中需要在中文翻译里保持前后一致的内容：人名、地名、作品名、组织机构、品牌、专业术语等。
+        prompt = f"""以下是某视频的全部字幕文本（每行一句）。请提取其中需要在中文翻译里保持前后一致的内容，包括两类：
+
+A. 需要统一译名的专有名词：人名、地名、作品名、组织机构、品牌、专业术语，给出统一的中文译法。
+B. 必须原样保留、绝不能翻译或“纠错”的字面量：按键与按键序列（如 zz、qq、dd、gg、Ctrl+C、:wq）、命令与命令行参数、代码标识符、文件名、快捷键、专用缩写。
+   这类词条的 zh 必须填写与 term 完全相同的字符串（包括重复字母，如 zz → zz，不得写成 z）。
 
 普通词汇和常见词不要提取；没有可提取的内容则输出空数组 []。
 
-输出格式：JSON 数组 [{{"term": "原文", "zh": "统一的中文译法"}}]，不要输出其他任何内容。
+输出格式：JSON 数组 [{{"term": "原文", "zh": "统一的中文译法或原样字面量"}}]，不要输出其他任何内容。
 
 字幕文本：
 {numbered}
@@ -1099,111 +1116,27 @@ class LLMClient:
 
 # ==================== 字幕后处理 ====================
 
-def split_long_sentence(text: str, max_chars: int) -> List[str]:
-    """仅在标点符号处把超长文本拆成多条（无标点的超长子句保持完整，不做硬切）。
+def compute_char_budgets(sentences: List[Dict],
+                         chars_per_sec: float = 4.2) -> List[int]:
+    """按每句可用时长换算中文译文字数上限，注入翻译 prompt 约束译文长度。
 
-    带有成对标点保护（《》、“”、‘’、（）等内不切断）与连续省略号（.../……）保护。
-    只负责文本切分，不涉及任何时间信息；真实时间轴由后续的
-    build_layout 根据 TTS 实测时长决定。
+    可用时长取「本句起点 → 下一句起点」（含句间静音间隙），因为时间轴按
+    原句起点硬锚定，本句配音最多只能占用到下一句开始之前的这段时间。
     """
-    delimiters = {'，', '、', '；', ',', ';', '。', '！', '？', '…', '!', '?', '.'}
-
-    pair_open = {'“': '”', '‘': '’', '《': '》', '（': '）', '(': ')', '【': '】', '[': ']', '"': '"', "'": "'"}
-    pair_close = {'”': '“', '’': '‘', '》': '《', '）': '（', ')': '(', '】': '【', ']': '['}
-
-    # 第一遍：按标点切成子句（带有状态机保护）
-    clauses = []
-    last_end = 0
-    stack: List[str] = []
-
-    i = 0
-    while i < len(text):
-        char = text[i]
-
-        # 跟踪成对标点开闭
-        if char in ('"', "'"):
-            if stack and stack[-1] == char:
-                stack.pop()
-            else:
-                stack.append(char)
-        elif char in pair_open:
-            stack.append(char)
-        elif char in pair_close:
-            if stack and stack[-1] == pair_close[char]:
-                stack.pop()
-
-        in_pair = len(stack) > 0
-        is_delimiter = False
-        cut_index = i + 1
-
-        if not in_pair and char in delimiters and i > 5:
-            # 防护 (1)：数字千分位或小数点 (如 46,000 / 3.14)
-            if (char in (',', '，', '.') and i + 1 < len(text)
-                    and text[i - 1].isdigit() and text[i + 1].isdigit()):
-                is_delimiter = False
-            # 防护 (2)：连续英文点/省略号 (如 ... 或 ……)，吃完所有连续点后再断
-            elif char in ('.', '…'):
-                next_i = i
-                while next_i < len(text) and text[next_i] in ('.', '…'):
-                    next_i += 1
-                # 如果是单个点且紧跟字母/数字（如 Dr. Smith / e.g.），不作为句尾断点
-                if next_i - i == 1 and char == '.' and next_i < len(text) and text[next_i].isalnum():
-                    is_delimiter = False
-                else:
-                    is_delimiter = True
-                    cut_index = next_i
-                    i = next_i - 1  # 游标跳过整个省略号
-            else:
-                is_delimiter = True
-
-        if is_delimiter:
-            clauses.append(text[last_end:cut_index])
-            last_end = cut_index
-
-        i += 1
-
-    if last_end < len(text):
-        clauses.append(text[last_end:])
-
-    # 第二遍：把子句打包到不超过 max_chars 的片段。
-    # 注意：单个子句本身超长且内部没有标点时，不做硬切（保持整句完整）
-    parts = []
-    buffer = ""
-    for clause in clauses:
-        if len(buffer) + len(clause) <= max_chars:
-            buffer += clause
+    budgets: List[int] = []
+    n = len(sentences)
+    for i, sent in enumerate(sentences):
+        if i + 1 < n:
+            avail_ms = sentences[i + 1]["start_ms"] - sent["start_ms"]
         else:
-            if buffer:
-                parts.append(buffer)
-            buffer = clause
-    if buffer:
-        parts.append(buffer)
-
-    # 把纯标点片段并回相邻片段：单独一个标点无法合成语音，会让 TTS 报错
-    merged: List[str] = []
-    for part in parts:
-        if merged and not has_speakable_text(part):
-            merged[-1] += part
-        else:
-            merged.append(part)
-    if len(merged) > 1 and not has_speakable_text(merged[0]):
-        merged[1] = merged[0] + merged[1]
-        del merged[0]
-
-    return merged
+            avail_ms = sent["end_ms"] - sent["start_ms"]
+        budgets.append(max(int(round(max(avail_ms, 0) / 1000.0 * chars_per_sec)), 4))
+    return budgets
 
 
-def postprocess_subtitles(sentences: List[Dict], translations: List[str],
-                          max_chars: int) -> List[Dict]:
-    """按句聚合为配音单元（每句一个 TTS 合成单元 + 供屏幕展示的多行拆分）。
-
-    每个单元包含：
-    - text: 完整译文，作为 TTS 的合成输入（保留完整语境，修复多音字失去
-      上下文导致误读的问题，如把"第一行"拆开会让 TTS 丢失"行"的读音线索）；
-    - lines: 供字幕屏幕展示的多行文本（超过 max_chars 时按标点拆分），
-      仅用于 SRT 渲染，不参与 TTS 合成；
-    - span_start/span_end: 原句时间跨度，真实起止时间由后续 build_layout
-      根据整句配音实测时长决定，再按字符比例切分给各展示行。
+def postprocess_subtitles(sentences: List[Dict],
+                          translations: List[str]) -> List[Dict]:
+    """组装配音单元：1 句原文 = 1 条译文 = 1 段 TTS 音频 = 1 条字幕。
 
     纯标点/无实际内容的译文（无法 TTS）会被跳过。
     """
@@ -1215,14 +1148,8 @@ def postprocess_subtitles(sentences: List[Dict], translations: List[str],
             print(f"[后处理] 跳过无可朗读内容的译文: {trans!r}")
             continue
 
-        if len(trans) > max_chars:
-            lines = [p.strip() for p in split_long_sentence(trans, max_chars)]
-        else:
-            lines = [trans]
-
         result.append({
             "text": trans,
-            "lines": lines,
             "span_start": sent["start_ms"],
             "span_end": sent["end_ms"],
         })
@@ -1259,8 +1186,8 @@ class TTSClient:
         self.mix_with_original = config.get("mix_with_original", False)
         self.batch_size = max(1, int(config.get("batch_size", 50)))
         self.concurrency = max(1, int(config.get("concurrency", 5)))
-        self.max_tempo = max(1.0, float(config.get("max_tempo", 3.0)))
-        self.min_tempo = min(1.0, max(0.5, float(config.get("min_tempo", 0.85))))
+        self.max_tempo = max(1.0, float(config.get("max_tempo", 1.5)))
+        self.min_tempo = min(1.0, max(0.5, float(config.get("min_tempo", 1.0))))
 
         # 缓存签名不纳入任何 api_key 字段（含 mimo.api_key 嵌套项），避免密钥变更导致误判缓存失效，
         # 也避免密钥被写入缓存指纹
@@ -1516,24 +1443,13 @@ class TTSClient:
 def mix_tts_audio(clips: List[Dict], output_audio: Path):
     """将各配音片段按最终时间轴混入完整音轨（numpy 实现，替代 amix 滤镜）。
 
-    clips: build_layout 的输出。同一整句若被拆成多行展示，会共用同一个
-    音频文件（file 相同）——这里按 file 去重，只在整句的起始时间混入一次，
-    避免同一段配音被重复叠加播放。
+    clips 为 build_layout 的输出，1 条 = 1 段配音音频。
     """
     if not clips:
         return
 
     clips = sorted(clips, key=lambda c: c["start_ms"])
-
-    # 按音频文件去重：同一文件只取第一次出现（即整句起始时间）
-    seen_files = set()
-    audio_clips = []
-    for clip in clips:
-        f = clip.get("file")
-        if not f or f in seen_files:
-            continue
-        seen_files.add(f)
-        audio_clips.append(clip)
+    audio_clips = [c for c in clips if c.get("file")]
 
     decoded = []
     total_samples = SAMPLE_RATE  # 至少留 1 秒尾部
@@ -1543,8 +1459,8 @@ def mix_tts_audio(clips: List[Dict], output_audio: Path):
         decoded.append([offset, pcm])
         total_samples = max(total_samples, offset + len(pcm) + SAMPLE_RATE)
 
-    # 防止语音重叠的兜底：正常情况下新时间轴不会重叠，仅当某句组触发最高倍速
-    # 仍超长时才会发生。超出部分直接截断并淡出。
+    # 时间轴按原句起点硬锚定，配音达到最高倍速仍超长时会压到下一句起点，
+    # 这里统一截断并淡出，保证不与下一句语音重叠。
     FADE_SAMPLES = int(SAMPLE_RATE * 0.01)  # 10ms 淡出
     truncated = 0
     for i in range(len(decoded)):
@@ -1575,7 +1491,7 @@ def mix_tts_audio(clips: List[Dict], output_audio: Path):
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(master.tobytes())
 
-    print(f"[音频] 已拼接 {len(clips)} 条配音: {output_audio}")
+    print(f"[音频] 已拼接 {len(audio_clips)} 条配音: {output_audio}")
 
 
 def _decode_to_pcm16(path: Path, sample_rate: Optional[int] = None) -> np.ndarray:
@@ -1601,30 +1517,22 @@ def _decode_to_pcm16(path: Path, sample_rate: Optional[int] = None) -> np.ndarra
 
 
 def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
-                 max_tempo: float = 3.0, min_tempo: float = 0.85,
+                 max_tempo: float = 1.5, min_tempo: float = 1.0,
                  known_durations: Optional[List[Optional[int]]] = None
                  ) -> List[Dict]:
-    """为字幕计算最终时间轴（字幕与配音共用同一套时间）。
+    """为字幕计算最终时间轴（字幕与配音共用同一套时间），1 句 = 1 条。
 
-    pieces 中每项对应一句完整译文的 TTS 合成单元（含 text 全句 + lines 展示行）。
+    采用**硬锚定**排布：每句的起始时间严格等于原句起始时间，绝不因为上一句
+    配音超长而顺延，从根本上杜绝音画滞后随视频推进而累积。
 
-    与逐句锚定原始 ASR 时间戳的做法不同，这里采用**流式排布**：
-    - 每句的起始时间由"上一句配音实际结束时间"和"本句原始起始时间"共同决定，
-      不会因为原字幕时间戳的间隙而产生死板的静音空白；
-    - 配音明显短于原时间槽时，允许在 [min_tempo, 1.0) 范围内轻微放慢填充，
-      减少"读完早早留白"的观感（放慢幅度设了下限，避免语速过慢显得怪异）；
-    - 配音超出原时间槽时，优先"顺延挤占"后续本就存在的静音间隙（级联吸收，
-      不会像之前那样只借用紧邻下一句的间隙就没有余地了）；仍放不下才按
-      max_tempo 上限加速，此时不做截断，而是允许推迟后续所有句子的起始时间
-      （由 start_ms 使用上一句实际结束时间保证连贯，不会产生重叠）。
+    单句时间预算 = 本句起点 → 下一句起点（含句间静音间隙）：
+    - 配音放得下：保持原速，或在 [min_tempo, 1.0) 内轻微放慢填充空白；
+    - 配音放不下：在 max_tempo 以内加速；仍放不下时不再顺延，由混音阶段
+      在下一句起点处淡出截断（翻译阶段的字数预算已从源头抑制这种情况）。
 
-    随后按各展示行的字符数比例，把整句时长分摊给屏幕上显示的多行字幕
-    （仅影响显示切换时刻，不影响音频，因为音频是整句合成，不再按行拆分，
-    从而保留完整语境供 TTS 消歧多音字）。
     无音频（--no-tts / --no-video 模式）时退化为按 130ms/字 估算排布。
 
-    返回 [{text, start_ms, end_ms, file, tempo}, ...]，按时间升序；
-    同句的多行展示项共用同一个 file 与 tempo（音频不重复生成/加速）。
+    返回 [{text, start_ms, end_ms, file, tempo}, ...]，按时间升序。
     """
     EST_MS_PER_CHAR = 130  # 无实测时长时的退化估算值
 
@@ -1642,52 +1550,32 @@ def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
     layout = []
     sped_count = 0
     slowed_count = 0
+    overflow_count = 0
     max_tempo_seen = 1.0
     min_tempo_seen = 1.0
-    total_delay_ms = 0  # 因前面句子超时累积的级联延迟
 
     n = len(pieces)
     for i, piece in enumerate(pieces):
-        span_start = piece["span_start"]
-        span_end = piece["span_end"]
+        start = piece["span_start"]
         dur = durations[i]
 
-        # 起始时间：本句原始时间戳与"上一句实际结束时间 + 累积延迟"取较大者，
-        # 保证不与前一句重叠；配音早读完时不会强行贴原时间戳提前，也不会
-        # 因为原字幕间隙留下死板空白（下面用 avail 吸收间隙）。
-        actual_start = max(span_start, layout[-1]["_seg_end"] if layout else span_start)
-
-        # 可用时长：把本句原始跨度、以及后续连续句子之间的原始静音间隙
-        # 都作为预算来源（级联吸收多句间隙，而不只是紧邻下一句）。
-        nominal_span = max(span_end - span_start, 0)
-        gap_budget = 0
-        j = i + 1
-        while j < n:
-            prev_end = pieces[j - 1]["span_end"]
-            gap = max(pieces[j]["span_start"] - prev_end, 0)
-            if gap <= 0:
-                break
-            gap_budget += gap
-            j += 1
-        avail = max(nominal_span + gap_budget, 0)
+        if i + 1 < n:
+            avail = max(pieces[i + 1]["span_start"] - start, 0)
+        else:
+            avail = max(piece["span_end"] - start, dur)
 
         tempo = 1.0
         if dur > avail > 0:
-            # 配音超时：优先顺延挤占后续间隙，仍不够则按 max_tempo 加速
-            # （不做截断，级联延迟由后续句子的 actual_start 自动吸收）。
             raw = dur / avail
             tempo = min(raw, max_tempo)
             if raw > max_tempo:
-                print(f"[警告] {ms_to_srt_time(span_start)} 起的字幕明显超长："
-                      f"配音需 {dur}ms / 可用 {avail}ms，"
-                      f"已按最高 {max_tempo}x 加速，多余部分将顺延占用后续时间轴")
+                overflow_count += 1
+                print(f"[警告] {ms_to_srt_time(start)} 起的字幕偏长："
+                      f"配音需 {dur}ms / 可用 {avail}ms，已按最高 {max_tempo}x 加速，"
+                      f"超出部分将在下一句开始处淡出截断")
         elif avail > 0 and dur < avail:
-            # 配音明显偏短：在 [min_tempo, 1.0) 范围内轻微放慢填充，减少空白；
-            # 差距过大时不做过度拉伸（避免语速失真），保留少量自然停顿即可。
-            raw = dur / avail
-            tempo = max(raw, min_tempo)
+            tempo = max(dur / avail, min_tempo)
 
-        total_adj = max(int(dur / tempo), 100)  # 保底 100ms 防零时长
         if tempo > 1.005:
             sped_count += 1
             max_tempo_seen = max(max_tempo_seen, tempo)
@@ -1695,41 +1583,25 @@ def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
             slowed_count += 1
             min_tempo_seen = min(min_tempo_seen, tempo)
 
-        seg_end = actual_start + total_adj
-        if seg_end - span_end > 0:
-            total_delay_ms = max(total_delay_ms, seg_end - span_end)
+        adj = max(int(dur / tempo), 100)  # 保底 100ms 防零时长
+        end = start + (min(adj, avail) if avail > 0 else adj)
 
-        # 按字符数比例，把整句配音时长分摊给各展示行（仅影响字幕切换时刻）
-        lines = piece.get("lines") or [piece["text"]]
-        char_counts = [max(len(line), 1) for line in lines]
-        total_chars = sum(char_counts)
-
-        t = actual_start
-        for k, line in enumerate(lines):
-            is_last = (k == len(lines) - 1)
-            if is_last:
-                line_dur = total_adj - (t - actual_start)
-            else:
-                line_dur = max(int(total_adj * char_counts[k] / total_chars), 1)
-            line_dur = max(line_dur, 1)
-            layout.append({
-                "text": line,
-                "start_ms": t,
-                "end_ms": t + line_dur,
-                "file": tts_files[i] if tts_files else None,
-                "tempo": tempo,
-                "_seg_end": seg_end,  # 内部字段：本句（整句）实际结束时间，供下一句起始时间参考
-            })
-            t += line_dur
+        layout.append({
+            "text": piece["text"],
+            "start_ms": start,
+            "end_ms": max(end, start + 100),
+            "file": tts_files[i] if tts_files else None,
+            "tempo": tempo,
+        })
 
     if sped_count:
         print(f"[时间轴] {sped_count} 条配音已加速填充时间槽（最高 {max_tempo_seen:.2f}x）")
     if slowed_count:
         print(f"[时间轴] {slowed_count} 条配音已放慢填充时间槽（最低 {min_tempo_seen:.2f}x）")
-    if total_delay_ms > 0:
-        print(f"[时间轴] 因配音超时累积的最大顺延约 {total_delay_ms}ms（后续字幕/配音已顺延排布，不影响同步）")
+    if overflow_count:
+        print(f"[时间轴] {overflow_count} 条配音达到最高倍速仍超长，将被截断"
+              f"（可调低 subtitle.chars_per_sec 让译文更精简）")
 
-    # 对需要变速的音频统一处理（每个 TTS 文件只变速一次，即使对应多行展示）
     if tts_files:
         fitted_cache: Dict[Path, Path] = {}
         for entry in layout:
@@ -1738,10 +1610,6 @@ def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
                 if f not in fitted_cache:
                     fitted_cache[f] = speed_up_audio(f, entry["tempo"])
                 entry["file"] = fitted_cache[f]
-
-    # 清理内部字段，避免污染下游（生成 SRT / 混音）使用的数据结构
-    for entry in layout:
-        entry.pop("_seg_end", None)
 
     return layout
 
@@ -1969,9 +1837,10 @@ def compose_final_video(video_path: Path, srt_path: Optional[Path],
 
 def translate_sentences(llm_config: Dict, sentences: List[Dict],
                         title: str, description: str,
-                        output_dir: Path, video_id: str
+                        output_dir: Path, video_id: str,
+                        chars_per_sec: float = 4.2
                         ) -> Tuple[List[str], Optional[str]]:
-    """翻译阶段：提取术语表 → 逐句翻译 → 翻译标题。
+    """翻译阶段：提取术语表 → 逐句翻译（带字数预算与滑动窗口）→ 翻译标题。
 
     所有中间结果写入 {video_id}_translations.json，中断后重跑自动断点续传。
     返回 (译文列表, 中文标题或 None)。
@@ -2035,7 +1904,8 @@ def translate_sentences(llm_config: Dict, sentences: List[Dict],
         translations = [done_map[i] for i in range(len(sentences))]
         print("[翻译] 命中完整缓存，跳过 API 调用")
     else:
-        translations = llm.translate(sentences, title, description,
+        budgets = compute_char_budgets(sentences, chars_per_sec)
+        translations = llm.translate(sentences, title, budgets,
                                      done=done_map, on_progress=save_cache,
                                      glossary=glossary)
         save_cache({i: t for i, t in enumerate(translations)})
@@ -2080,12 +1950,20 @@ def translate_title_cached(llm: "LLMClient", title: str, description: str,
 
 def main():
     parser = argparse.ArgumentParser(description="YouTube 视频自动下载 + 中文字幕生成 + 中文配音")
-    parser.add_argument("url", help="YouTube 视频 URL")
+    parser.add_argument("url", help="YouTube 视频 URL 或 11位视频 ID")
     parser.add_argument("-o", "--output", default="./youtube_downloads", help="根输出目录")
     parser.add_argument("--no-video", action="store_true", help="只下载字幕，不下载视频")
     parser.add_argument("--no-tts", action="store_true", help="跳过中文配音")
     parser.add_argument("--no-nvenc", action="store_true",
                         help="禁用 NVIDIA GPU 硬件编码，强制使用 CPU (libx264)")
+    parser.add_argument("--skip-download", action="store_true",
+                        help="跳过视频/字幕/封面下载，直接使用本地已有的文件")
+    parser.add_argument("--redo-translate", action="store_true",
+                        help="清除 LLM 翻译缓存，强制重新翻译")
+    parser.add_argument("--redo-tts", action="store_true",
+                        help="清除 TTS 配音缓存，强制重新生成配音")
+    parser.add_argument("--start-step", type=int, choices=range(1, 9), default=1,
+                        help="指定从哪一步骤开始执行 (1:元数据, 2:下载, 3:解析, 4:分句, 5:翻译, 6:组装, 7:配音, 8:合成)")
 
     args = parser.parse_args()
 
@@ -2103,11 +1981,45 @@ def main():
     print(f"[输出目录] {output_dir}")
 
     try:
+        # 清除指定步骤的缓存
+        if args.redo_translate:
+            cache_trans_path = output_dir / f"{video_id}_translations.json"
+            if cache_trans_path.exists():
+                cache_trans_path.unlink()
+                print(f"[缓存] 已清除翻译缓存: {cache_trans_path.name}")
+
+        if args.redo_tts:
+            tts_cache_path = output_dir / "tts_cache.json"
+            if tts_cache_path.exists():
+                tts_cache_path.unlink()
+            for f in output_dir.glob("tts_*.*"):
+                f.unlink(missing_ok=True)
+            print(f"[缓存] 已清除 TTS 配音缓存")
+
         # 步骤 1: 获取元数据 + 检测语言
         print("=" * 60)
-        print("步骤 1: 获取视频元数据")
-        print("=" * 60)
-        metadata = get_video_metadata(args.url)
+        meta_file = output_dir / "metadata.json"
+        if args.skip_download or args.start_step > 2:
+            print("步骤 1: 读取本地视频元数据")
+            print("=" * 60)
+            if meta_file.exists():
+                metadata = read_json_safe(meta_file) or {}
+                print(f"[元数据] 已从本地 {meta_file.name} 加载")
+            else:
+                try:
+                    metadata = get_video_metadata(args.url)
+                    with open(meta_file, "w", encoding="utf-8") as f:
+                        json.dump(metadata, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    print(f"[警告] 无法联网获取元数据，使用默认元数据: {e}")
+                    metadata = {"id": video_id, "title": video_id, "description": ""}
+        else:
+            print("步骤 1: 获取视频元数据")
+            print("=" * 60)
+            metadata = get_video_metadata(args.url)
+            with open(meta_file, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+
         title = metadata.get("title", "Unknown")
         description = metadata.get("description", "")
 
@@ -2119,36 +2031,74 @@ def main():
         video_path = None
         thumbnail_path = None
 
-        # 步骤 2: 下载视频和字幕
+        # 步骤 2: 下载视频和字幕 / 复用本地文件
         print("\n" + "=" * 60)
-        print("步骤 2: 下载视频和 JSON3 字幕")
-        print("=" * 60)
-
-        if args.no_video:
-            subtitle_args = [
-                "--write-auto-subs",
-                "--sub-langs", sub_langs,
-                "--sub-format", "json3",
-                "--write-thumbnail",
-                "--convert-thumbnails", "jpg",
-                "--skip-download",
-                "-o", str(output_dir / "%(id)s"),
-                args.url,
-            ]
-            result = run_yt_dlp(subtitle_args, stream=True)
-            if result.returncode != 0:
-                print("[下载] 自动字幕下载失败，尝试手动字幕...")
-                subtitle_args[0] = "--write-subs"
-                result = run_yt_dlp(subtitle_args, stream=True)
-
+        if args.skip_download or args.start_step > 2:
+            print("步骤 2: 免下载模式，直接读取本地视频和字幕")
+            print("=" * 60)
             sub_path = find_downloaded_sub(output_dir, video_id, sub_langs)
             if sub_path is None:
+                json3_files = list(output_dir.glob("*.json3"))
+                if json3_files:
+                    sub_path = json3_files[0]
+            if sub_path is None:
                 raise SystemExit(
-                    f"[错误] 未找到 json3 字幕文件（语言候选: {sub_langs}）。\n"
-                    "       该视频可能不提供 json3 格式的字幕，而本脚本依赖词级时间戳，无法继续。")
-            video_path = None
+                    f"[错误] 未在 {output_dir} 找到 .json3 字幕文件，无法继续。")
+
+            if not args.no_video:
+                for f in output_dir.iterdir():
+                    if not f.stem.startswith(video_id):
+                        continue
+                    if f.stem[len(video_id):].startswith("_zh"):
+                        continue
+                    if f.suffix.lower() in (".mp4", ".webm", ".mkv", ".mov"):
+                        video_path = f
+                        break
+                if video_path is None:
+                    v_files = [f for f in output_dir.iterdir()
+                               if f.suffix.lower() in (".mp4", ".webm", ".mkv", ".mov")
+                               and not f.stem.endswith("_zh")]
+                    if v_files:
+                        video_path = v_files[0]
+                if video_path is None:
+                    print(f"[警告] 未在 {output_dir} 找到原始视频文件，最终将只生成 SRT 字幕。")
+
+            thumbnail_path = next((f for f in output_dir.iterdir()
+                                   if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")), None)
+            print(f"[复用本地] 字幕: {sub_path}")
+            if video_path:
+                print(f"[复用本地] 视频: {video_path}")
+            if thumbnail_path:
+                print(f"[复用本地] 封面: {thumbnail_path}")
         else:
-            video_path, sub_path, thumbnail_path, _ = download_video_and_subs(args.url, output_dir, sub_langs, metadata)
+            print("步骤 2: 下载视频和 JSON3 字幕")
+            print("=" * 60)
+
+            if args.no_video:
+                subtitle_args = [
+                    "--write-auto-subs",
+                    "--sub-langs", sub_langs,
+                    "--sub-format", "json3",
+                    "--write-thumbnail",
+                    "--convert-thumbnails", "jpg",
+                    "--skip-download",
+                    "-o", str(output_dir / "%(id)s"),
+                    args.url,
+                ]
+                result = run_yt_dlp(subtitle_args, stream=True)
+                if result.returncode != 0:
+                    print("[下载] 自动字幕下载失败，尝试手动字幕...")
+                    subtitle_args[0] = "--write-subs"
+                    result = run_yt_dlp(subtitle_args, stream=True)
+
+                sub_path = find_downloaded_sub(output_dir, video_id, sub_langs)
+                if sub_path is None:
+                    raise SystemExit(
+                        f"[错误] 未找到 json3 字幕文件（语言候选: {sub_langs}）。\n"
+                        "       该视频可能不提供 json3 格式的字幕，而本脚本依赖词级时间戳，无法继续。")
+                video_path = None
+            else:
+                video_path, sub_path, thumbnail_path, _ = download_video_and_subs(args.url, output_dir, sub_langs, metadata)
 
         # 步骤 3: 解析 JSON3
         print("\n" + "=" * 60)
@@ -2175,16 +2125,14 @@ def main():
         print("步骤 5: LLM 翻译")
         print("=" * 60)
         translations, title_zh = translate_sentences(
-            llm_config, sentences, title, description, output_dir, video_id)
+            llm_config, sentences, title, description, output_dir, video_id,
+            chars_per_sec=sub_config.get("chars_per_sec", 4.2))
 
-        # 步骤 6: 切分中文字幕文本（纯文本规则；真实时间轴由配音实测时长决定）
+        # 步骤 6: 组装配音单元（1 句 = 1 译文 = 1 段配音 = 1 条字幕）
         print("\n" + "=" * 60)
-        print("步骤 6: 切分中文字幕文本")
+        print("步骤 6: 组装中文字幕单元")
         print("=" * 60)
-        pieces = postprocess_subtitles(
-            sentences, translations,
-            sub_config["max_chars_per_line"],
-        )
+        pieces = postprocess_subtitles(sentences, translations)
 
         # 步骤 7: 合成配音 + 按真实语音时长排布时间轴 + 生成 SRT
         print("\n" + "=" * 60)
@@ -2207,8 +2155,8 @@ def main():
 
             # 有实测时长则按真实语音排布（字幕与配音天然同步）；
             # 否则退化为按 130ms/字 估算排布
-            max_tempo = tts.max_tempo if tts else 3.0
-            min_tempo = tts.min_tempo if tts else 0.85
+            max_tempo = tts.max_tempo if tts else 1.5
+            min_tempo = tts.min_tempo if tts else 1.0
             clips = build_layout(pieces, tts_files, max_tempo, min_tempo,
                                  known_durations=tts_durations)
             srt_path = output_dir / f"{video_id}_zh.srt"
