@@ -97,8 +97,8 @@ DEFAULT_CONFIG = {
         "min_sentence_sec": 1.5,   # 原句时长低于该值时，与相邻句合并为一个翻译/配音单元，
                                    # 避免过短时间槽导致配音要么被迫拉长要么严重加速
         "max_merge_chars": 200,    # 合并时原文字符数上限，防止连续短句无限合并成过长的单元
-        "max_chars_per_line": 20,  # 单条字幕最大显示字符数；超过则按标点切成多条依次显示，
-                                   # 仅影响字幕展示（配音仍是整句合成，不受影响），0 表示不切分
+        "max_chars_per_line": 20,  # 单条字幕最大显示字符数；超过时仅在。，等标点处切成多条依次显示，
+                                   # 无可用标点则整句原样显示；仅影响字幕展示（配音仍是整句合成），0 表示不切分
         "min_caption_ms": 800      # 切分后每条字幕的最短显示时长（ms），过短的段会并回相邻段
     }
 }
@@ -1192,29 +1192,12 @@ def _caption_cut_candidates(text: str) -> List[Tuple[int, int]]:
     return candidates
 
 
-def _hard_split_caption(text: str, max_chars: int) -> List[str]:
-    """无可用标点时按长度硬切，尽量不切断连续的英文单词/数字。"""
-    parts: List[str] = []
-    rest = text
-    while len(rest) > max_chars:
-        cut = max_chars
-        while (cut > max_chars // 2
-               and rest[cut - 1].isalnum() and rest[cut].isalnum()
-               and rest[cut - 1].isascii() and rest[cut].isascii()):
-            cut -= 1
-        cut = max(cut, 1)  # 保证每轮至少推进 1 个字符，防止死循环
-        parts.append(rest[:cut].strip())
-        rest = rest[cut:].strip()
-    if rest:
-        parts.append(rest)
-    return parts
-
-
 def split_caption_text(text: str, max_chars: int) -> List[str]:
     """把超长译文按标点切成多条展示文本（不改变文字内容，只做切分）。
 
     切点优先在句子中部区间内选取，再按 。！？ > ； > ， > 、 的优先级挑选，
     避免开头一个句号就把两三个字单独切出去。
+    无可用标点时保持整句不切（max_chars 仅作为触发切分的阈值）。
     """
     text = text.strip()
     if max_chars <= 0 or len(text) <= max_chars:
@@ -1233,7 +1216,7 @@ def split_caption_text(text: str, max_chars: int) -> List[str]:
             return (split_caption_text(left, max_chars)
                     + split_caption_text(right, max_chars))
 
-    return _hard_split_caption(text, max_chars)
+    return [text]
 
 
 def split_clips_for_display(clips: List[Dict], max_chars: int,
