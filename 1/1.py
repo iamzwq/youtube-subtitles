@@ -72,6 +72,9 @@ DEFAULT_CONFIG = {
         "volume": "+0%",                   # 音量调整（相对默认音量的百分比，仅 edge-tts 支持）
         "pitch": "+0Hz",                   # 音调调整（相对默认音调的 Hz 偏移，仅 edge-tts 支持）
         "mix_with_original": False,        # 是否保留原声并与配音按比例混合（否则完全替换为配音）
+        "trim_silence": True,              # 裁掉每条配音首尾的空白（只裁两端，不动句中标点停顿）。
+                                           # edge-tts 每条固定带约 240ms 前置 + 650ms 尾部静音，不裁会让
+                                           # 语音整体晚于字幕起点，并使短句时长被高估而触发无谓加速
         "batch_size": 50,                  # 每批次并发提交生成的配音条数（用于分批写入缓存）
         "concurrency": 5,                  # 单批内实际并发请求 TTS 服务的数量
         "max_tempo": 2.0,                  # 配音超长时允许的最高加速倍速；仍放不下则淡出截断，
@@ -1317,6 +1320,7 @@ class TTSClient:
     def __init__(self, config: Dict, llm_config: Optional[Dict] = None):
         self.engine = config["engine"]
         self.mix_with_original = config["mix_with_original"]
+        self.trim_silence = config["trim_silence"]
         self.batch_size = max(1, int(config["batch_size"]))
         self.concurrency = max(1, int(config["concurrency"]))
         self.max_tempo = max(1.0, float(config["max_tempo"]))
@@ -1456,6 +1460,8 @@ class TTSClient:
                 save_manifest()
                 raise
             for idx, path in zip(batch_indexes, batch_files):
+                if self.trim_silence:
+                    trim_edge_silence(path)
                 files[idx] = path
             entries = entries[:len(pieces)]
             entries.extend({} for _ in range(len(pieces) - len(entries)))
@@ -1772,6 +1778,26 @@ def _atempo_chain_filter(tempo: float) -> str:
         remaining /= 2.0
     stages.append(remaining)
     return ",".join(f"atempo={s:.4f}" for s in stages)
+
+
+def trim_edge_silence(path: Path):
+    """就地裁掉音频首尾静音，各保留 50ms 余量；句中标点停顿原样保留。
+
+    两次 silenceremove 之间用 areverse 翻转，从而把「只裁开头」的滤镜复用到结尾。
+    失败时保留原音频，不影响后续流程。
+    """
+    trim = ("silenceremove=start_periods=1:start_silence=0.05:"
+            "start_threshold=-45dB:detection=peak")
+    tmp_path = path.with_suffix(".trim" + path.suffix)
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(path),
+           "-af", f"{trim},areverse,{trim},areverse", str(tmp_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode == 0 and tmp_path.exists() and tmp_path.stat().st_size > 0:
+        tmp_path.replace(path)
+    else:
+        tmp_path.unlink(missing_ok=True)
+        print(f"[警告] 裁剪首尾静音失败，保留原音频: {result.stderr}", file=sys.stderr)
 
 
 def speed_up_audio(path: Path, tempo: float) -> Path:
