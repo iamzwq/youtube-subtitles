@@ -45,8 +45,12 @@ DEFAULT_CONFIG = {
                                        # 注意：Chrome/Edge 等 Chromium 系浏览器运行时会锁定 cookie 数据库，
                                        # 使用该方式前必须完全退出浏览器进程，否则报错 "Could not copy ... cookie database"；
                                        # 如不方便每次关闭浏览器，改用 cookies_file 更省心
-        "cookies_file": ""             # 直接指定 Netscape 格式的 cookies.txt 文件路径（如用浏览器插件导出），
+        "cookies_file": "",            # 直接指定 Netscape 格式的 cookies.txt 文件路径（如用浏览器插件导出），
                                        # 不依赖浏览器进程是否运行；同时配置时优先于 cookies_from_browser
+        "ytdlp_args": []               # 追加给 yt-dlp 的额外命令行参数。YouTube 现在需要 JS 运行时才能解
+                                       # n challenge，yt-dlp 默认只启用 Deno；若未装 Deno 但有 Node，
+                                       # 填 ["--js-runtimes", "node"] 即可。否则报错
+                                       # "n challenge solving failed" / "The page needs to be reloaded"
     },
     "llm": {
         "base_url": "https://token-plan-cn.xiaomimimo.com/v1",  # LLM API 的 base_url（会自动补全 /v1 后缀）
@@ -161,7 +165,8 @@ ENGLISH_ABBREVIATIONS = {
 
 def is_abbreviation_or_non_sentence_period(word_text: str, next_word_text: Optional[str] = None) -> bool:
     """判断以 '.' 结尾的词是否为英文缩写、首字母缩写、版本号/数字等非断句句号。"""
-    stripped = (word_text or "").rstrip()
+    # JSON3 的词块通常带前导空格（如 " T."），必须两端都去掉后再匹配
+    stripped = (word_text or "").strip()
     if not stripped.endswith('.'):
         return False
 
@@ -200,16 +205,18 @@ MAX_RETRIES = DEFAULT_CONFIG["global"]["max_retries"]              # 网络 API 
 SAMPLE_RATE = DEFAULT_CONFIG["global"]["sample_rate"]              # 拼接音轨的采样率
 COOKIES_FROM_BROWSER = DEFAULT_CONFIG["global"]["cookies_from_browser"]  # yt-dlp 使用的浏览器 Cookie 来源
 COOKIES_FILE = DEFAULT_CONFIG["global"]["cookies_file"]            # yt-dlp 使用的 cookies.txt 文件路径
+YTDLP_EXTRA_ARGS = DEFAULT_CONFIG["global"]["ytdlp_args"]          # 追加给 yt-dlp 的额外参数
 
 
 def apply_global_config(config: Dict):
     """根据加载的配置动态更新全局常量（配置已与 DEFAULT_CONFIG 合并，键必定存在）"""
-    global MAX_RETRIES, SAMPLE_RATE, COOKIES_FROM_BROWSER, COOKIES_FILE
+    global MAX_RETRIES, SAMPLE_RATE, COOKIES_FROM_BROWSER, COOKIES_FILE, YTDLP_EXTRA_ARGS
     g = config["global"]
     MAX_RETRIES = int(g["max_retries"])
     SAMPLE_RATE = int(g["sample_rate"])
     COOKIES_FROM_BROWSER = (g["cookies_from_browser"] or "").strip()
     COOKIES_FILE = (g["cookies_file"] or "").strip()
+    YTDLP_EXTRA_ARGS = [str(a) for a in (g["ytdlp_args"] or [])]
 
 
 def load_config() -> Dict:
@@ -491,6 +498,7 @@ def run_yt_dlp(args: List[str], stream: bool = False) -> subprocess.CompletedPro
         cmd += ["--cookies", COOKIES_FILE]
     elif COOKIES_FROM_BROWSER:
         cmd += ["--cookies-from-browser", COOKIES_FROM_BROWSER]
+    cmd += YTDLP_EXTRA_ARGS
     cmd += args
     print(f"[yt-dlp] {' '.join(cmd)}")
 
