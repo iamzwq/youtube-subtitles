@@ -88,7 +88,9 @@ DEFAULT_CONFIG = {
             "model": "mimo-v2.5-tts",  # 语音合成模型名称
             "voice": "白桦",           # 预置音色：冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean 等
             "style_instruction": "",  # 可选：自然语言风格指令（放入 user 消息，用于控制语气/情绪）
-            "format": "wav"           # 输出音频格式，wav 或 mp3
+            "format": "wav",          # 输出音频格式，wav 或 mp3
+            "pause_every": 100,       # 每生成多少条配音就暂停一次，规避服务端请求频率上限（0 为不暂停）
+            "pause_sec": 60           # 每次暂停的时长（秒）
         }
     },
     "subtitle": {
@@ -1308,14 +1310,16 @@ class TTSClient:
         self.max_tempo = max(1.0, float(config["max_tempo"]))
         self.min_tempo = min(1.0, max(0.5, float(config["min_tempo"])))
 
-        # 缓存签名不纳入任何 api_key 字段（含 mimo.api_key 嵌套项），避免密钥变更导致误判缓存失效，
-        # 也避免密钥被写入缓存指纹
-        def _strip_api_keys(d: Dict) -> Dict:
-            return {k: (_strip_api_keys(v) if isinstance(v, dict) else v)
-                    for k, v in d.items() if k != "api_key"}
+        # 缓存签名只覆盖影响音频内容的配置：排除 api_key（避免密钥写入指纹/变更误判失效）
+        # 与限流调优项（不改变语音本身，改动不应让已生成的配音全部作废）
+        volatile_keys = {"api_key", "pause_every", "pause_sec"}
+
+        def _strip_volatile(d: Dict) -> Dict:
+            return {k: (_strip_volatile(v) if isinstance(v, dict) else v)
+                    for k, v in d.items() if k not in volatile_keys}
 
         self.cache_signature = hashlib.sha1(
-            json.dumps(_strip_api_keys(config), sort_keys=True,
+            json.dumps(_strip_volatile(config), sort_keys=True,
                        ensure_ascii=False).encode("utf-8")
         ).hexdigest()
 
@@ -1342,6 +1346,8 @@ class TTSClient:
                 raise ValueError("mimo-tts 引擎需要 tts.mimo.voice 指定预置音色")
             self.mimo_format = mimo_config["format"]
             self.mimo_style_instruction = mimo_config["style_instruction"] or ""
+            self.mimo_pause_every = max(0, int(mimo_config["pause_every"]))
+            self.mimo_pause_sec = max(0.0, float(mimo_config["pause_sec"]))
             self.mimo_client = OpenAI(api_key=api_key, base_url=base_url, timeout=120)
             print(f"[TTS] 引擎: mimo-tts, 模型: {self.mimo_model}, "
                   f"音色: {self.mimo_voice}")
@@ -1399,8 +1405,12 @@ class TTSClient:
 
         print(f"[TTS] 共 {len(pieces)} 条配音，缓存命中 {len(pieces) - len(missing)} 条，"
               f"待生成 {len(missing)} 条")
-        for batch_start in range(0, len(missing), self.batch_size):
-            batch_indexes = missing[batch_start:batch_start + self.batch_size]
+        # mimo-tts 按每分钟请求数限流，用批间暂停把请求摊开，避免整批 429
+        pausing = (self.engine == "mimo-tts"
+                   and self.mimo_pause_every > 0 and self.mimo_pause_sec > 0)
+        batch_size = self.mimo_pause_every if pausing else self.batch_size
+        for batch_start in range(0, len(missing), batch_size):
+            batch_indexes = missing[batch_start:batch_start + batch_size]
             batch_pieces = [pieces[idx] for idx in batch_indexes]
             try:
                 generate_fn = (self._generate_edge_tts if self.engine == "edge-tts"
@@ -1426,8 +1436,11 @@ class TTSClient:
                 entries[idx] = make_entry(idx)
                 durations[idx] = entries[idx]["duration_ms"]
             save_manifest()
-            print(f"[TTS] 进度: {min(batch_start + self.batch_size, len(missing))}/"
+            print(f"[TTS] 进度: {min(batch_start + batch_size, len(missing))}/"
                   f"{len(missing)} 条待生成")
+            if pausing and batch_start + batch_size < len(missing):
+                print(f"[TTS] 规避限流：暂停 {self.mimo_pause_sec:g}s 后继续...")
+                await asyncio.sleep(self.mimo_pause_sec)
 
         return files, durations
 
@@ -1508,7 +1521,8 @@ class TTSClient:
                     except Exception as e:
                         if attempt == MAX_RETRIES:
                             raise
-                        wait = 2 ** attempt
+                        # 失败多为 429，限流窗口按分钟计，短退避重试基本仍会失败
+                        wait = 30 * attempt
                         print(f"[TTS] 第 {idx} 条生成失败 (第 {attempt}/{MAX_RETRIES} 次): {e}，{wait}s 后重试...")
                         await asyncio.sleep(wait)
 
