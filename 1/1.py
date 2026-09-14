@@ -40,12 +40,8 @@ DEFAULT_CONFIG = {
     "global": {
         "max_retries": 3,             # 网络 API（LLM/TTS）调用失败时的最大重试次数
         "sample_rate": 48000,         # 配音音轨拼接采样率（Hz），影响音质与解码/混音精度
-        "cookies_from_browser": "",   # yt-dlp 携带浏览器登录 Cookie，缓解 429 限流，如 "chrome"/"edge"/"firefox"，留空则不使用
-                                       # 注意：Chrome/Edge 等 Chromium 系浏览器运行时会锁定 cookie 数据库，
-                                       # 使用该方式前必须完全退出浏览器进程，否则报错 "Could not copy ... cookie database"；
-                                       # 如不方便每次关闭浏览器，改用 cookies_file 更省心
         "cookies_file": "",            # 直接指定 Netscape 格式的 cookies.txt 文件路径（如用浏览器插件导出），
-                                       # 不依赖浏览器进程是否运行；同时配置时优先于 cookies_from_browser
+                                       # 不依赖浏览器进程是否运行
         "ytdlp_args": []               # 追加给 yt-dlp 的额外命令行参数。YouTube 现在需要 JS 运行时才能解
                                        # n challenge，yt-dlp 默认只启用 Deno；若未装 Deno 但有 Node，
                                        # 填 ["--js-runtimes", "node"] 即可。否则报错
@@ -207,18 +203,16 @@ def is_abbreviation_or_non_sentence_period(word_text: str, next_word_text: Optio
 
 MAX_RETRIES = DEFAULT_CONFIG["global"]["max_retries"]              # 网络 API 最大重试次数
 SAMPLE_RATE = DEFAULT_CONFIG["global"]["sample_rate"]              # 拼接音轨的采样率
-COOKIES_FROM_BROWSER = DEFAULT_CONFIG["global"]["cookies_from_browser"]  # yt-dlp 使用的浏览器 Cookie 来源
 COOKIES_FILE = DEFAULT_CONFIG["global"]["cookies_file"]            # yt-dlp 使用的 cookies.txt 文件路径
 YTDLP_EXTRA_ARGS = DEFAULT_CONFIG["global"]["ytdlp_args"]          # 追加给 yt-dlp 的额外参数
 
 
 def apply_global_config(config: Dict):
     """根据加载的配置动态更新全局常量（配置已与 DEFAULT_CONFIG 合并，键必定存在）"""
-    global MAX_RETRIES, SAMPLE_RATE, COOKIES_FROM_BROWSER, COOKIES_FILE, YTDLP_EXTRA_ARGS
+    global MAX_RETRIES, SAMPLE_RATE, COOKIES_FILE, YTDLP_EXTRA_ARGS
     g = config["global"]
     MAX_RETRIES = int(g["max_retries"])
     SAMPLE_RATE = int(g["sample_rate"])
-    COOKIES_FROM_BROWSER = (g["cookies_from_browser"] or "").strip()
     COOKIES_FILE = (g["cookies_file"] or "").strip()
     YTDLP_EXTRA_ARGS = [str(a) for a in (g["ytdlp_args"] or [])]
 
@@ -498,10 +492,7 @@ def run_yt_dlp(args: List[str], stream: bool = False) -> subprocess.CompletedPro
     """
     cmd = ["yt-dlp"]
     if COOKIES_FILE:
-        # cookies_file 优先于 cookies_from_browser：不依赖浏览器进程/锁文件，更稳定
         cmd += ["--cookies", COOKIES_FILE]
-    elif COOKIES_FROM_BROWSER:
-        cmd += ["--cookies-from-browser", COOKIES_FROM_BROWSER]
     cmd += YTDLP_EXTRA_ARGS
     cmd += args
     print(f"[yt-dlp] {' '.join(cmd)}")
@@ -594,7 +585,7 @@ def find_local_media(output_dir: Path,
 
 
 def download_video_and_subs(url: str, output_dir: Path, sub_langs: str,
-                            metadata: Dict, skip_video: bool = False
+                            metadata: Dict
                             ) -> Tuple[Optional[Path], Path, Optional[Path]]:
     """下载视频和 JSON3 字幕（metadata 由调用方传入，避免重复执行 yt-dlp 获取元数据）"""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -609,8 +600,7 @@ def download_video_and_subs(url: str, output_dir: Path, sub_langs: str,
     def build_ytdlp_cmd(sub_flag: str) -> List[str]:
         """构造 yt-dlp 下载命令（自动字幕失败后换 --write-subs 重试）"""
         return [
-            *(["--skip-download"] if skip_video
-              else ["-f", "bestvideo*+bestaudio/best"]),
+                        "-f", "bestvideo*+bestaudio/best",
             sub_flag,
             "--sub-langs", sub_langs,
             "--sub-format", "json3",
@@ -630,10 +620,7 @@ def download_video_and_subs(url: str, output_dir: Path, sub_langs: str,
 
     video_path, thumbnail_path = find_local_media(output_dir, video_id)
     sub_path = find_downloaded_sub(output_dir, video_id, sub_langs)
-    if skip_video:
-        # 目录里可能残留着上次下载的视频，--no-video 下不让它参与后续流程
-        video_path = None
-    elif video_path is None:
+    if video_path is None:
         raise FileNotFoundError(f"未找到下载的视频文件 (ID: {video_id})")
     if sub_path is None:
         # SystemExit 不被 main 的 except Exception 捕获，直接退出且不带堆栈
@@ -1630,7 +1617,7 @@ def build_layout(pieces: List[Dict], tts_files: Optional[List[Path]],
     - 配音放不下：在 max_tempo 以内加速；仍放不下时不再顺延，由混音阶段
       在下一句起点处淡出截断（翻译阶段的字数预算已从源头抑制这种情况）。
 
-    无音频（--no-tts / --no-video 模式）时按 chars_per_sec 估算时长排布。
+    无音频（--no-tts 模式）时按 chars_per_sec 估算时长排布。
 
     返回 [{text, start_ms, end_ms, file, tempo}, ...]，按时间升序。
     """
@@ -2035,7 +2022,6 @@ def main():
     parser = argparse.ArgumentParser(description="YouTube 视频自动下载 + 中文字幕生成 + 中文配音")
     parser.add_argument("url", help="YouTube 视频 URL 或 11位视频 ID")
     parser.add_argument("-o", "--output", default="./youtube_downloads", help="根输出目录")
-    parser.add_argument("--no-video", action="store_true", help="只下载字幕，不下载视频")
     parser.add_argument("--no-tts", action="store_true", help="跳过中文配音")
     parser.add_argument("--no-nvenc", action="store_true",
                         help="禁用 NVIDIA GPU 硬件编码，强制使用 CPU (libx264)")
@@ -2108,7 +2094,7 @@ def main():
         sub_langs = detect_sub_langs(metadata)
         print(f"[语言] 字幕语言候选: {sub_langs}")
 
-        # 提前初始化，避免 --no-video 模式下引用未定义变量导致 NameError
+        # 先初始化本地媒体路径；免下载模式下可能只有字幕文件
         video_path = None
         thumbnail_path = None
 
@@ -2127,11 +2113,10 @@ def main():
                     f"[错误] 未在 {output_dir} 找到 .json3 字幕文件，无法继续。")
 
             local_video, thumbnail_path = find_local_media(output_dir, video_id)
-            if not args.no_video:
-                video_path = local_video
-                if video_path is None:
-                    print(f"[警告] 未在 {output_dir} 找到原始视频文件（需命名为 {video_id}.mp4 等），"
-                          "最终将只生成 SRT 字幕。")
+            video_path = local_video
+            if video_path is None:
+                print(f"[警告] 未在 {output_dir} 找到原始视频文件（需命名为 {video_id}.mp4 等），"
+                      "最终将只生成 SRT 字幕。")
 
             print(f"[复用本地] 字幕: {sub_path}")
             if video_path:
@@ -2142,7 +2127,7 @@ def main():
             print("步骤 2: 下载视频和 JSON3 字幕")
             print("=" * 60)
             video_path, sub_path, thumbnail_path = download_video_and_subs(
-                args.url, output_dir, sub_langs, metadata, skip_video=args.no_video)
+                args.url, output_dir, sub_langs, metadata)
 
         # 步骤 3: 解析 JSON3
         print("\n" + "=" * 60)
@@ -2189,8 +2174,8 @@ def main():
         clips = []
         cleanup_tts_cache = False
         try:
-            # 配音合成仅在需要产出视频时进行；--no-video 模式只输出估算时间轴的 SRT
-            if not args.no_video and not args.no_tts and tts_config["enabled"]:
+            # 配音合成仅在需要产出视频时进行
+            if not args.no_tts and tts_config["enabled"]:
                 tts = TTSClient(tts_config, llm_config)
                 # 自然语速合成全部配音（此时还没有最终时间轴）
                 tts_files, tts_durations = asyncio.run(
@@ -2220,7 +2205,7 @@ def main():
 
             # 步骤 8: 合成最终视频（字幕烧录 + 中文配音一步完成，只做一次视频转码）
             final_path = None
-            if video_path and not args.no_video:
+            if video_path:
                 print("\n" + "=" * 60)
                 print("步骤 8: 合成最终视频（字幕烧录 + 中文配音）")
                 print("=" * 60)
