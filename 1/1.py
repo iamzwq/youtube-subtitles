@@ -420,48 +420,54 @@ def _stream_subprocess(cmd: List[str], label: str,
         if len(tail) > 60:
             del tail[:-60]
 
-        if is_tty:
-            if label == "yt-dlp":
-                m = _YTDLP_PROGRESS_RE.search(line)
-                if m:
-                    pct = float(m.group(1))
-                    size = m.group(2)
-                    speed = m.group(3)
-                    eta = m.group(4) or m.group(5)
+        # yt-dlp / FFmpeg 只显示进度这一行，其余日志静默丢弃（仍保留在 tail 里供出错时打印）
+        if label == "yt-dlp":
+            m = _YTDLP_PROGRESS_RE.search(line)
+            if m:
+                pct = float(m.group(1))
+                size = m.group(2)
+                speed = m.group(3)
+                eta = m.group(4) or m.group(5)
+                bar = _make_ascii_bar(pct)
+                speed_str = f" | {speed}" if speed and speed != "Unknown" else ""
+                eta_str = f" | ETA {eta}" if eta and eta != "Unknown" else ""
+                disp = f"[yt-dlp] 下载进度: {bar} {pct:5.1f}% | {size}{speed_str}{eta_str}"
+                if is_tty:
+                    sys.stdout.write("\r" + disp.ljust(79))
+                    sys.stdout.flush()
+                    in_progress_bar = True
+                else:
+                    print(disp)
+            return
+
+        if label == "FFmpeg":
+            m_time = _FFMPEG_TIME_RE.search(line)
+            if m_time:
+                h, m_val, s_val = int(m_time.group(1)), int(m_time.group(2)), float(m_time.group(3))
+                curr_sec = h * 3600 + m_val * 60 + s_val
+                m_speed = _FFMPEG_SPEED_RE.search(line)
+                speed_str = f" | {m_speed.group(1)}" if m_speed else ""
+                curr_str = _format_time_s(curr_sec)
+
+                if total_duration_s and total_duration_s > 0:
+                    pct = min(100.0, max(0.0, curr_sec / total_duration_s * 100.0))
                     bar = _make_ascii_bar(pct)
-                    speed_str = f" | {speed}" if speed and speed != "Unknown" else ""
-                    eta_str = f" | ETA {eta}" if eta and eta != "Unknown" else ""
-                    disp = f"\r[yt-dlp] 下载进度: {bar} {pct:5.1f}% | {size}{speed_str}{eta_str}"
-                    sys.stdout.write(disp.ljust(79))
+                    total_str = _format_time_s(total_duration_s)
+                    disp = f"[FFmpeg] 合成进度: {bar} {pct:5.1f}% ({curr_str} / {total_str}){speed_str}"
+                else:
+                    disp = f"[FFmpeg] 正在合成: time={curr_str}{speed_str}"
+
+                if is_tty:
+                    sys.stdout.write("\r" + disp.ljust(79))
                     sys.stdout.flush()
                     in_progress_bar = True
-                    return
+                else:
+                    print(disp)
+            return
 
-            elif label == "FFmpeg":
-                m_time = _FFMPEG_TIME_RE.search(line)
-                if m_time:
-                    h, m_val, s_val = int(m_time.group(1)), int(m_time.group(2)), float(m_time.group(3))
-                    curr_sec = h * 3600 + m_val * 60 + s_val
-                    m_speed = _FFMPEG_SPEED_RE.search(line)
-                    speed_str = f" | {m_speed.group(1)}" if m_speed else ""
-                    curr_str = _format_time_s(curr_sec)
-
-                    if total_duration_s and total_duration_s > 0:
-                        pct = min(100.0, max(0.0, curr_sec / total_duration_s * 100.0))
-                        bar = _make_ascii_bar(pct)
-                        total_str = _format_time_s(total_duration_s)
-                        disp = f"\r[FFmpeg] 合成进度: {bar} {pct:5.1f}% ({curr_str} / {total_str}){speed_str}"
-                    else:
-                        disp = f"\r[FFmpeg] 正在合成: time={curr_str}{speed_str}"
-
-                    sys.stdout.write(disp.ljust(79))
-                    sys.stdout.flush()
-                    in_progress_bar = True
-                    return
-
+        if is_tty:
             # 非进度信息行：如果此前展示了进度条，先擦除
             clear_progress_bar()
-
         print(f"[{label}] {line}")
 
     while True:
@@ -862,16 +868,19 @@ class LLMClient:
                 batch_chars += next_chars
                 cursor += 1
 
-            # 保留全局真实编号，避免续传时错位
-            # 滑动窗口：上文给已确定的中文译文，下文给尚未翻译的原文
-            prev_context = [results[i] for i in range(max(todo[0] - 3, 0), todo[0])
-                            if i in results]
-            next_preview = [s["text"] for s in sentences[todo[-1] + 1: todo[-1] + 4]]
-
             system_msg = "你是一位专业的视频字幕翻译师。你只输出合法的 JSON 数组，不输出任何其他内容。"
             batch_result: Dict[int, str] = {}
             missing = list(todo)
             for attempt in range(1, MAX_RETRIES + 1):
+                # 上下文按当前这批缺失句重新定位：合并跨批次的 results 与本批次已翻译的
+                # batch_result，取缺失句前后最近的已译/待译句子——这样重试单独重发部分
+                # 句子时，同批次内已翻译的相邻句也能作为上下文，不再只有跨批次边界可用。
+                combined = {**results, **batch_result}
+                prev_context = [combined[i] for i in range(max(missing[0] - 3, 0), missing[0])
+                                if i in combined]
+                next_preview = [sentences[i]["text"]
+                                for i in range(missing[-1] + 1, min(missing[-1] + 4, n_total))
+                                if i not in combined]
                 # 重试时只重发缺失的句子，并适度提升 temperature 引入变化避免死锁
                 prompt = self._build_prompt(
                     [sentences[i] for i in missing], title, missing, glossary,
@@ -942,8 +951,9 @@ class LLMClient:
                       budgets: List[int],
                       prev_context: List[str],
                       next_preview: List[str]) -> str:
+        # 下限取上限的 80%，引导译文贴近可用时长而不是一味往短了译
         numbered_lines = [
-            f"{sentence_id}. [中文不超过 {budget} 字] {sentence['text']}"
+            f"{sentence_id}. [中文 {max(round(budget * 0.8), 1)}~{budget} 字] {sentence['text']}"
             for sentence_id, sentence, budget in zip(ids, sentences, budgets)
         ]
         numbered_text = "\n".join(numbered_lines)
@@ -968,7 +978,7 @@ class LLMClient:
 {glossary_block}{context_block}
 请严格逐句翻译，不要合并或拆分句子，不要遗漏任何一句。译文应自然流畅，符合中文表达习惯，适合作为视频字幕。
 
-字数约束（重要）：每句前的 [中文不超过 N 字] 是该句配音可用时长换算出的硬性上限。请宁简勿繁，主动意译精简：删去可有可无的定语、语气词和重复表达，保留核心信息即可，不得超出字数上限。
+字数约束（重要）：每句前的 [中文 A~B 字] 中，B 是该句配音可用时长换算出的硬性上限，绝不能超过；A 是建议下限。这个区间是给该句配音配的可用时长，请让译文贴近区间上限、充分利用这段时长，不要为了"精简"而把译文压得远低于下限——配音读完早、字幕还没到下一句，会在画面上留出好几秒的尴尬空白。只有原句信息量确实很少、按自然表达已经说完想说的内容时，才可以低于下限；但绝不能靠重复、堆砌无意义的修饰词来凑够字数，一切以译文自然、贴合原意为前提。
 
 快捷键、命令、代码和界面文字等英文/数字字面量请原样保留，不要翻译或“纠错”。特别注意：像 zz、qq、dd 这类重复字母很可能是真实的按键序列（如 Vim 按键），不是拼写错误，不得删减重复字母。
 
